@@ -1,0 +1,7 @@
+# Optional dependencies for scripts/capture_screenshot.py.
+# The bridge core itself does not need any of these; install only if
+# you want to capture Vivado main-window screenshots from Python.
+# Currently Windows-only.
+
+pywin32>=300
+Pillow>=10.0

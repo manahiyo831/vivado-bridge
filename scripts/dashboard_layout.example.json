@@ -1,0 +1,21 @@
+{
+  "_comment": "Example layout for setup_dashboard.py. List order = display order.",
+
+  "vio": [
+    {"name": "mode_select_2",      "direction": "out", "radix": "BINARY"},
+    {"name": "led_force_2[3:0]",   "direction": "out", "radix": "HEX"},
+    {"name": "mode_select_1",      "direction": "in",  "radix": "BINARY"},
+    {"name": "led_force_1[3:0]",   "direction": "in",  "radix": "HEX"},
+    {"name": "led_internal_1[3:0]", "direction": "in", "radix": "HEX"},
+    {"name": "toggle_1",           "direction": "in",  "radix": "BINARY"}
+  ],
+
+  "ila": [
+    {"name": "mode_select",        "style": "Digital", "radix": "BINARY"},
+    {"name": "fast_counter[7:0]",  "style": "Analog",  "radix": "UNSIGNED"},
+    {"name": "state_fast[1:0]",    "style": "Digital", "radix": "HEX"},
+    {"name": "led_internal[3:0]",  "style": "Digital", "radix": "HEX"},
+    {"name": "toggle",             "style": "Digital", "radix": "BINARY"},
+    {"name": "pulse_short",        "style": "Digital", "radix": "BINARY"}
+  ]
+}

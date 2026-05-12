@@ -10,13 +10,14 @@ bridge -- entirely from Python/Tcl, no Vivado GUI required.
 > for the AI / Python side to analyze.
 
 > **Quick path**: the runtime side of this flow (configure / set
-> trigger / arm / wait / export CSV / parse) is now covered by
-> `operations.ila`. Read [op_ila.md](op_ila.md) for the Python API;
-> this document is the design-time companion (mark_debug, debug XDC,
-> trigger syntax, capture buffer behaviour, the ILA pitfalls below).
-> When you're at "I have a programmed device with an ILA visible and
-> I want a CSV", reach for `from operations import ila` rather than
-> hand-writing `set_property TRIGGER_COMPARE_VALUE ...` snippets.
+> trigger / arm / wait / export CSV / parse) is now covered by the
+> `ila.*` dispatcher ops. Read [op_ila.md](op_ila.md) for the JSON
+> API; this document is the design-time companion (mark_debug, debug
+> XDC, trigger syntax, capture buffer behaviour, the ILA pitfalls
+> below). When you're at "I have a programmed device with an ILA
+> visible and I want a CSV", reach for the `ila.*` ops via
+> `vivado_op.py` rather than hand-writing
+> `set_property TRIGGER_COMPARE_VALUE ...` snippets.
 
 ## Why a separate document
 
@@ -83,39 +84,25 @@ input/output relationship at clock-cycle resolution.
 
 ## 2. Marking signals for debug
 
-Add `(* mark_debug = "true", keep = "true" *)` to the `wire` / `reg`
-declarations you want to observe. `mark_debug` tells Vivado to expose
-the net as a debug candidate and avoid optimizing it away;
-`keep = "true"` additionally preserves the **original wire name** so
-post-synth `get_nets <name>` resolves to the canonical name you wrote
-in HDL (without it Vivado may rename / re-shape the net during
-optimization, which makes your `connect_debug_port` calls miss).
-Neither of these inserts an ILA on its own.
+Add `(* mark_debug = "true" *)` to the `wire` / `reg` declarations
+you want to observe. The attribute is a *hint* -- it tells Vivado
+to keep the net through optimization and expose it as a debug
+candidate. It does **not** create an ILA on its own.
 
 ```verilog
-(* mark_debug = "true", keep = "true" *) reg  [7:0] fast_counter;
-(* mark_debug = "true", keep = "true" *) reg  [1:0] state_fast;
-(* mark_debug = "true", keep = "true" *) wire       mode_select;
-(* mark_debug = "true", keep = "true" *) wire [3:0] led_internal;
+(* mark_debug = "true" *) reg  [7:0] fast_counter;
+(* mark_debug = "true" *) reg  [1:0] state_fast;
+(* mark_debug = "true" *) wire       mode_select;
+(* mark_debug = "true" *) wire [3:0] led_internal;
 ```
 
-If the same wire is **also fed into a VIO** (the typical pattern
-when you want to read it from a host script and capture it on the
-ILA simultaneously), add `mark_debug_valid = "true"` as well -- see
-§8.5 for the rationale and a worked example. The combined three-way
-attribute string `(* mark_debug = "true", mark_debug_valid = "true",
-keep = "true" *)` is safe to use even on nets that aren't (yet)
-shared with a VIO; the `_valid` flag is only consulted by the
-debug-graph filter and has no observable effect when there is no
-filter to bypass.
+Verify after synthesis via the `exec_tcl.py` escape hatch:
 
-Verify after synthesis:
-
-```python
-c.exec_tcl("open_run synth_1 -name synth_1")
-r = c.exec_tcl("get_nets -hier -filter {MARK_DEBUG==1}")
-print(r.output)
-# fast_counter[0] fast_counter[1] ... mode_select led_internal[0] ...
+```bash
+python exec_tcl.py "open_run synth_1 -name synth_1"
+python exec_tcl.py "get_nets -hier -filter {MARK_DEBUG==1}"
+# Response output:
+#   fast_counter[0] fast_counter[1] ... mode_select led_internal[0] ...
 ```
 
 If a signal you marked doesn't appear, it was probably optimized
@@ -129,9 +116,9 @@ example is a 16-bit `count` driven internally with no port connection),
 **Vivado's synthesis removes the register completely** without
 `mark_debug`. The signs you've hit this:
 
-```python
-c.exec_tcl("get_cells -hier <reg_name>")    # empty -> register removed
-c.exec_tcl("get_nets -hier <reg_name>*")    # empty -> nets gone too
+```bash
+python exec_tcl.py "get_cells -hier <reg_name>"    # empty -> register removed
+python exec_tcl.py "get_nets -hier <reg_name>*"    # empty -> nets gone too
 ```
 
 Adding `(* mark_debug = "true" *)` resurrects the register: after
@@ -242,8 +229,8 @@ your top-level clock is named differently.)
 ## 4. Build
 
 After `save_constraints` plus the manual clock fix, run a normal
-`reset_run synth_1; reset_run impl_1` and then
-`build.implement(c)`. The ILA + dbg_hub are inserted automatically
+`reset_run synth_1; reset_run impl_1` and then call `build.implement`
+via the dispatcher. The ILA + dbg_hub are inserted automatically
 during opt/place/route. On success:
 
 - `bit` is generated as usual.
@@ -285,14 +272,12 @@ Examples:
 
 ### Tcl bracing matters
 
-When passing trigger values through `client.exec_tcl(...)`, the
-single-quote in `eq1'bR` is interpreted by Tcl as a string delimiter
-unless you enclose the whole token in `{...}`. **Always brace it:**
+When passing trigger values through `exec_tcl.py`, the single-quote
+in `eq1'bR` is interpreted by Tcl as a string delimiter unless you
+enclose the whole token in `{...}`. **Always brace it:**
 
-```python
-c.exec_tcl(
-    "set p [get_hw_probes mode_select -of [get_hw_ilas hw_ila_1]]; "
-    "set_property TRIGGER_COMPARE_VALUE {eq1'bR} $p")
+```bash
+python exec_tcl.py "set p [get_hw_probes mode_select -of [get_hw_ilas hw_ila_1]]; set_property TRIGGER_COMPARE_VALUE {eq1'bR} \$p"
 ```
 
 Without the braces you get
@@ -329,63 +314,59 @@ you want to trigger on `eq1'bR` of `direction`. If you only set
 `mode_select == 1 AND rising-edge of direction` -- not what you wanted.
 And there is no error message; the ILA just never triggers.
 
-**Use `ila.set_triggers(values=..., clear_others=True)`** -- it
-resets every other probe to don't-care first, then applies your
-conditions, in one atomic call. This is exactly the pattern this API
-was added to encode:
+**Use `ila.set_triggers` with `clear_others=true`** -- it resets
+every other probe to don't-care first, then applies your conditions,
+in one atomic call. This is exactly the pattern this API was added
+to encode:
 
-```python
-from operations import ila
-
-ila.set_triggers(c, values={
-    "direction": "rising",
-})
+```bash
+python vivado_op.py '{"op":"ila.set_triggers","params":{"values":{"direction":"rising"}}}'
 # Every other probe on hw_ila_1 was reset to don't-care first, so
 # stale conditions from earlier captures cannot contaminate this arm.
 ```
 
 If you need to set values without clearing the others (rare), pass
-`clear_others=False` -- and accept the responsibility of tracking
-what's still set on each probe. The default is `True` precisely
+`"clear_others": false` -- and accept the responsibility of tracking
+what's still set on each probe. The default is `true` precisely
 because forgetting to reset is the trap that made this API necessary.
 
 ## 6. Arm, drive, capture
 
-```python
-# (Trigger already configured above.)
+The high-level flow is: pre-trigger state → arm → confirm armed →
+drive the trigger → wait → export. Each step is one dispatcher call;
+the `ila.arm` + `ila.wait_for_capture` pair encapsulates the polling
+loop that we used to write by hand.
 
-# 1. Make sure the design is in a "pre-trigger" state.
-debug.write_vio_probe(c, probe='mode_select_2', value='0')   # VIO output
-time.sleep(0.2)
+```bash
+# 1. Make sure the design is in a "pre-trigger" state (host-side
+#    sleep separates the write from the arm).
+python vivado_op.py '{"op":"debug.write_vio_probe","params":{"probe":"mode_select_2","value":"0"}}'
 
 # 2. Arm.
-c.exec_tcl("run_hw_ila [get_hw_ilas hw_ila_1]")
+python vivado_op.py '{"op":"ila.arm","params":{}}'
 
-# 3. Confirm armed (poll instead of trusting wait_on_hw_ila).
-status = c.exec_tcl(
-    "get_property STATUS.CORE_STATUS [get_hw_ilas hw_ila_1]").output
-assert status == "WAITING FOR TRIGGER", status
+# 3. Confirm armed.
+python vivado_op.py '{"op":"ila.get_status","params":{}}'
+# Expect status == "WAITING FOR TRIGGER"
 
 # 4. Drive the trigger condition via VIO.
-debug.write_vio_probe(c, probe='mode_select_2', value='1')
+python vivado_op.py '{"op":"debug.write_vio_probe","params":{"probe":"mode_select_2","value":"1"}}'
 
-# 5. Poll until full (or timeout).
-import time
-deadline = time.time() + 5.0
-while time.time() < deadline:
-    status = c.exec_tcl(
-        "get_property STATUS.CORE_STATUS [get_hw_ilas hw_ila_1]").output
-    if status == "FULL":
-        break
-    time.sleep(0.05)
-else:
-    raise RuntimeError(f"ILA didn't trigger: {status}")
+# 5. Wait until full (or timeout).
+python vivado_op.py '{"op":"ila.wait_for_capture","params":{"timeout":5.0}}'
 
 # 6. Upload + export.
-c.exec_tcl("upload_hw_ila_data [get_hw_ilas hw_ila_1]")
-c.exec_tcl(
-    "write_hw_ila_data -force "
-    "-csv_file {capture.csv} [current_hw_ila_data]")
+python vivado_op.py '{"op":"ila.export_csv","params":{"path":"capture.csv"}}'
+```
+
+If you absolutely need the raw Tcl form (e.g. for a status read that
+the dispatcher doesn't expose), reach for the escape hatch:
+
+```bash
+python exec_tcl.py "get_property STATUS.CORE_STATUS [get_hw_ilas hw_ila_1]"
+python exec_tcl.py "run_hw_ila [get_hw_ilas hw_ila_1]"
+python exec_tcl.py "upload_hw_ila_data [get_hw_ilas hw_ila_1]"
+python exec_tcl.py "write_hw_ila_data -force -csv_file {capture.csv} [current_hw_ila_data]"
 ```
 
 ### `wait_on_hw_ila` caveat
@@ -454,101 +435,22 @@ counter     = col_int('fast_counter[7:0]')
 
 ## 8. VIO + ILA naming collision
 
-### VIO inputs and outputs are both auto-MARK_DEBUG'd
+### VIO outputs are auto-MARK_DEBUG'd
 
-**Any net connected to a VIO `probe_in*` or `probe_out*` port gets
-`MARK_DEBUG=1` as a side-effect of the IP customization** (Vivado
-2024.1; undocumented). The implication for ILA: by default Vivado
-filters VIO-attached nets out of the debug graph, so a plain
-`connect_debug_port u_ila_0/probeN [get_nets <vio-attached-net>]`
-binds the port to 0 channels even though the call returns success.
-The fix is simple — see §8.5 (`mark_debug_valid`).
+Before the renaming story: be aware that **any net connected to a VIO
+`probe_out*` port gets `MARK_DEBUG=1` set on it as a side-effect of
+the IP customization**. This is undocumented but consistent on Vivado
+2024.1: open the synth run and `get_nets -filter {MARK_DEBUG==1}` will
+include the VIO output nets even if you never wrote `(* mark_debug *)`
+on them in HDL.
 
-Side note: if you rely on `create_debug_core`'s auto-pickup of
-`MARK_DEBUG` nets (rather than explicit per-probe `connect_debug_port`
-calls), the ILA captures the union of your nets *and* the VIO
-inputs/outputs. `debug.create_ila_core` uses explicit attach, so this
-auto-pickup mode is not the path you take when going through the
-Python wrapper.
-
-### 8.5 Watching the same net with VIO and ILA simultaneously
-
-The "VIO drives a control wire, host script reads it back, ILA
-captures it cycle-precise" pattern is common. To make it work, mark
-the shared net with **all three** attributes:
-
-```verilog
-(* mark_debug = "true", mark_debug_valid = "true", keep = "true" *)
-wire [7:0] q;
-
-vio_0 u_vio (
-    .clk        (sysclk),
-    .probe_in0  (q),       // VIO observes q
-    ...
-);
-
-counter8 u_dut ( .q(q), ... );
-```
-
-Then attach the same `q` to an ILA via `debug.create_ila_core` as
-usual:
-
-```python
-debug.create_ila_core(c,
-    name="u_ila_0",
-    clock_net="sysclk_IBUF_BUFG",
-    probes=[{"name": "q", "nets": [f"q[{i}]" for i in range(8)]}],
-    depth=4096,
-    dbg_hub_clock_freq_hz=125_000_000,
-)
-```
-
-Why each attribute matters:
-
-- `mark_debug`: keeps the net through optimization and exposes it
-  to the debug infrastructure (same as §2).
-- `mark_debug_valid = "true"`: tells the debug-graph filter "this
-  net is allowed on an ILA probe even though it also feeds a VIO."
-  Without it, Vivado silently filters the net out of the ILA
-  probe's net list, the bind goes to 0 channels, and impl fails with
-  `[Chipscope 16-213] probeN has K unconnected channels` a minute or
-  two later. The attribute is the mechanism Vivado provides for
-  exactly this case; with it the bind survives all the way through
-  bitstream.
-- `keep = "true"`: preserves the wire's original name so `get_nets q`
-  resolves post-synth (`debug.create_ila_core` rejects calls that
-  reference nets whose names don't exist with `error_kind="not_found"`,
-  so a renamed net would fail the pre-flight check).
-
-Verification (post-synth):
-
-```python
-c.exec_tcl("get_property MARK_DEBUG       [get_nets q[0]]")  # "1"
-c.exec_tcl("get_property MARK_DEBUG_VALID [get_nets q[0]]")  # "true"
-```
-
-After programming the device, `q` will appear in **both**
-`debug.list_vio_probes(c)` (with the VIO-side `_1` suffix described
-just below) and `ila.list_ila_probes(c)`, and reads from both go to
-the same physical wire.
-
-#### When you forget `mark_debug_valid`
-
-Symptom: `debug.create_ila_core(...)` succeeds (because the
-pre-flight only checks net existence, not bind success), but
-`build.implement` fails partway through opt_design with
-`ERROR: [Chipscope 16-213] The debug port 'u_ila_X/probeN' has
-K unconnected channels`. The error message names the probe but not
-the offending net; correlate with the `probes=` list you passed to
-`create_ila_core`. Add `mark_debug_valid = "true"` in HDL, re-synth,
-re-impl.
-
-(Why isn't this caught earlier? `connect_debug_port` returns success
-on a 0-channel bind, and the `get_nets -of_objects [get_debug_ports
-…]` query that would show 0 nets is unreliable on Vivado 2024.1 —
-it returns an empty result even for binds that survive impl. The
-SKILL therefore stops at typo / non-existent-net checks and lets the
-impl-time DRC catch the rest.)
+Why this matters: if you then add your own `mark_debug` to a different
+signal set and rely on `create_debug_core`'s automatic probe pickup,
+the resulting ILA will probe the **union** -- yours plus the VIO
+outputs -- which is usually more probes (and more LUTs) than you
+intended. To get only the probes you asked for, use explicit
+`connect_debug_port` to a named net list rather than relying on
+"all marked nets" pickup.
 
 ### Probe rename due to collision
 
@@ -566,17 +468,18 @@ Empirical observation on Vivado 2024.1 with our `led_blink` design:
 | VIO input `led_OBUF`     | `led_OBUF`    | **`led_internal_1`** |
 | ILA probe `mode_select`  | (n/a)         | `mode_select` |
 
-So adding an ILA **breaks any Python script that hardcoded VIO probe
-names**. The only safe pattern is to call `debug.list_vio_probes(c)`
+So adding an ILA **breaks any script that hardcoded VIO probe
+names**. The only safe pattern is to call `debug.list_vio_probes`
 **after** programming and use whatever names come back. SKILL guidance:
 treat a fresh `program_device` like a fresh probe-name discovery.
 
 ### ILA runtime probe names follow the connected net, not `create_ila_core(name=...)`
 
-The `name` argument on each entry of `debug.create_ila_core(probes=[
-{name: ..., nets: ...}])` becomes the *logical* label, but at runtime
-(`set_triggers`, `parse_csv`, `list_ila_probes`) the names you see come
-from the underlying nets in the synthesized design.
+The `name` field on each entry of `debug.create_ila_core`'s `probes`
+list (`[{"name": ..., "nets": ...}, ...]`) becomes the *logical*
+label, but at runtime (`ila.set_triggers`, `ila.parse_csv`,
+`ila.list_ila_probes`) the names you see come from the underlying
+nets in the synthesized design.
 
 Two patterns to be aware of:
 
@@ -594,7 +497,7 @@ Two patterns to be aware of:
    overriding the user-supplied label.
 
 The recovery is the same in both cases — call
-`ila.list_ila_probes(c)` after `program_device` and use the names
+`ila.list_ila_probes` after `program_device` and use the names
 that come back; never hard-code from the `create_ila_core` argument
 list. The same applies to VIO probes (using_vio.md §2).
 
@@ -675,24 +578,23 @@ no debug core in it.
 The bridge wraps the whole sequence -- core creation, per-probe ports,
 dbg_hub clock fix, dedicated XDC routing -- in one call:
 
-```python
-from operations import build, debug
+```bash
+python vivado_op.py '{"op":"build.open_synth","params":{}}'
 
-build.open_synth(client)
-debug.create_ila_core(
-    client,
-    name="u_ila_0",
-    clock_net="clk_IBUF",
-    probes=[
-        {"name": "count",     "nets": [f"count[{i}]" for i in range(16)]},
-        {"name": "en",        "nets": "en"},
-        {"name": "direction", "nets": "direction"},
-    ],
-    depth=4096,
-    dbg_hub_clock_freq_hz=125_000_000,
-)
-build.close_design(client)
-build.implement(client)
+python vivado_op.py '{"op":"debug.create_ila_core","params":{
+  "name": "u_ila_0",
+  "clock_net": "clk_IBUF",
+  "probes": [
+    {"name": "count",     "nets": ["count[0]","count[1]","count[2]","count[3]","count[4]","count[5]","count[6]","count[7]","count[8]","count[9]","count[10]","count[11]","count[12]","count[13]","count[14]","count[15]"]},
+    {"name": "en",        "nets": "en"},
+    {"name": "direction", "nets": "direction"}
+  ],
+  "depth": 4096,
+  "dbg_hub_clock_freq_hz": 125000000
+}}'
+
+python vivado_op.py '{"op":"build.close_design","params":{}}'
+python vivado_op.py '{"op":"build.implement","params":{}}'
 ```
 
 Equivalent hand-rolled Tcl (in a dedicated `debug_<name>.xdc`):
@@ -793,7 +695,7 @@ on the next rising auto-start.
 
 Vivado writes ILA CSV headers like `dbg_out_x[6:0]`, not `dbg_out_x`.
 A naive `header.index("dbg_out_x")` raises ValueError. Use a partial
-match: `ila.find_column(columns, "dbg_out_x")` does this for you, and
+match: the `ila.find_column` dispatcher op does this for you, and
 returns the column index of the first header whose base name (before
 the `[`) equals the target. The same goes for radix annotation rows
 (`Radix - UNSIGNED,UNSIGNED,...`) -- `ila.parse_csv` already skips

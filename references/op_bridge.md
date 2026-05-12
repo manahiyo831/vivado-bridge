@@ -1,9 +1,10 @@
 # bridge operations
 
-`from operations import bridge`
+Bridge / Vivado-process introspection. One operation: locate the
+per-session log files Vivado writes.
 
-Bridge / Vivado-process introspection. Right now this is just one
-operation: locate the per-session log files Vivado writes.
+All operations are invoked via the `vivado_op.py` JSON dispatcher.
+See [SKILL.md](../SKILL.md) for the invocation pattern.
 
 ## Common shape
 
@@ -14,18 +15,23 @@ below.
 
 ## Operations
 
-### get_vivado_logs
+### bridge.get_vivado_logs
 
 Return the paths of Vivado's session log files.
 
-```python
-bridge.get_vivado_logs(client)
-# {
-#   'success': True,
-#   'cwd': 'C:/Users/<user>/AppData/Roaming/Xilinx/Vivado',
-#   'log_path': '.../vivado.log', 'log_exists': True, 'log_size': 183268,
-#   'jou_path': '.../vivado.jou', 'jou_exists': True, 'jou_size':   1465,
-# }
+**Request:**
+```json
+{"op": "bridge.get_vivado_logs"}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "cwd": "C:/Users/<user>/AppData/Roaming/Xilinx/Vivado",
+  "log_path": ".../vivado.log", "log_exists": true, "log_size": 183268,
+  "jou_path": ".../vivado.jou", "jou_exists": true, "jou_size": 1465
+}
 ```
 
 `vivado.log` is, in practice, **a transcript of the Tcl Console** for
@@ -55,14 +61,16 @@ Caveats:
 
 ## Typical flow
 
-```python
-from vivado_bridge_client import Client
-from operations import bridge
+```bash
+# 1. Get the log path
+echo '{"op":"bridge.get_vivado_logs"}' | python vivado_op.py
+# → response includes log_path
 
-c = Client.connect()
-info = bridge.get_vivado_logs(c)
-print(info["log_path"])
-# Then in your assistant: Read or Grep that file as needed.
-#   Grep -n "ERROR" vivado.log
-#   Read vivado.log  offset=last_known_line  limit=200
+# 2. Then on the host side, Read or Grep the file at log_path as needed:
+#    Grep -n "ERROR" <log_path>
+#    Read <log_path> with offset=last_known_line limit=200
 ```
+
+The bridge intentionally only returns the *path*. Reading the contents
+is done by the host-side tools so the agent's context window controls
+how much of the log is pulled in.

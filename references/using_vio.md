@@ -101,9 +101,9 @@ isolate. Option A keeps the IP run as its own first-class
 artifact, which is why this guide recommends it for
 non-trivial IPs.
 
-Then run `build.implement(c)` as usual. After it finishes:
+Then run `build.implement` as usual. After it finishes:
 
-- `build.summary(c)` should report `ltx_exists=True`.
+- `build.summary` should report `ltx_exists=true`.
 - `warnings` should **not** include `Designutils 20-1281`.
 
 If either of those is wrong, do not proceed to programming -- the
@@ -135,7 +135,7 @@ produces these runtime probes (observed on Vivado 2024.1):
 | `probe_out0` | `mode_select` |
 | `probe_out1` | `led_force` |
 
-**Always call `debug.list_vio_probes(client)` first** to discover the
+**Always call `debug.list_vio_probes` first** to discover the
 actual names before reading or writing. Hard-coding `probe_in0` will
 fail with `error_kind: not_found`.
 
@@ -164,19 +164,15 @@ or `(* mark_debug = "true" *)` to the wire and use a name that won't
 collide. But the simpler answer is: just call `list_vio_probes` once
 and use whatever Vivado gave you.
 
-### VIO inputs and outputs both come pre-marked for debug
+### VIO outputs come pre-marked for debug
 
-Every net connected to a VIO `probe_in*` or `probe_out*` port has
-`MARK_DEBUG=1` set as a side-effect of customizing the IP -- you did
-not write the attribute in HDL, but it is on the netlist. This bites
-in two ways when you also add an ILA: automatic `MARK_DEBUG` pickup
-captures the VIO nets too, and explicit ILA attachment to a VIO net
-silently binds 0 wires (`debug.create_ila_core` reports this as
-`mark_debug_missing=[...]`).
-
-See [using_ila.md §8](using_ila.md) for the full picture and the
-recommended workaround (explicit `connect_debug_port` to a named net
-list, preferring inside-instance nets).
+A subtlety that bites when you also add an ILA: every net connected to
+a VIO `probe_out*` port has `MARK_DEBUG=1` set on it as a side-effect
+of customizing the IP. You did not write the attribute in HDL, but it
+is on the netlist. If you then enable automatic ILA probe pickup based
+on `MARK_DEBUG`, the ILA will grab those nets too. See
+[using_ila.md §8](using_ila.md) for the consequences and the recommended
+workaround (explicit `connect_debug_port` to a named net list).
 
 ## 3. Reading and writing probe values
 
@@ -184,30 +180,30 @@ list, preferring inside-instance nets).
 
 A 4-bit probe needs **one** hex character, not four binary digits:
 
-```python
-debug.write_vio_probe(c, probe='led_force', value='A')   # OK -> 0xA = 1010
-debug.write_vio_probe(c, probe='led_force', value='1010')
+```bash
+# OK -> 0xA = 1010
+python vivado_op.py '{"op":"debug.write_vio_probe","params":{"probe":"led_force","value":"A"}}'
 # FAIL: tcl_error
-# "The hw_probe VIO value [1010] has [4] value characters.
-#  The required number of value characters for radix [HEX], is [1]."
+#   "The hw_probe VIO value [1010] has [4] value characters.
+#    The required number of value characters for radix [HEX], is [1]."
+python vivado_op.py '{"op":"debug.write_vio_probe","params":{"probe":"led_force","value":"1010"}}'
 ```
 
 Read values come back in the same radix:
 
-```python
-r = debug.read_vio_probe(c, probe='led_force_1')
-# r['value'] == 'a'
-n = int(r['value'], 16)   # 10
+```bash
+python vivado_op.py '{"op":"debug.read_vio_probe","params":{"probe":"led_force_1"}}'
+# response["value"] == "a"  -- convert host-side with int(value, 16) -> 10
 ```
 
 ### Switching to binary radix
 
-If you'd rather work in binary strings, set the probe's radix once:
+If you'd rather work in binary strings, set the probe's radix once
+via the `exec_tcl.py` escape hatch (the dispatcher deliberately does
+not expose raw Tcl):
 
-```python
-c.exec_tcl(
-  'set_property INPUT_VALUE_RADIX BINARY '
-  '[get_hw_probes <name> -of [get_hw_vios hw_vio_1]]')
+```bash
+python exec_tcl.py "set_property INPUT_VALUE_RADIX BINARY [get_hw_probes <name> -of [get_hw_vios hw_vio_1]]"
 ```
 
 For output probes the analogous property is `OUTPUT_VALUE_RADIX`.
@@ -219,6 +215,45 @@ If `write_vio_probe` returns `success=False` (typically a radix /
 width mismatch), the underlying VIO commit may have partially gone
 through. Always re-issue a known-good write or check the result with
 a read before continuing.
+
+### VIO is human-paced — hold pulses for ~1 second, not milliseconds
+
+VIO is designed for a human clicking a GUI dashboard. The end-to-end
+round trip — host script → JTAG → hw_server → dbg_hub → VIO core →
+fabric net — goes through several pipeline stages and a clock-domain
+crossing, so even at 125 MHz fabric clock the *effective* control
+bandwidth is well under 100 Hz. A reset or start pulse driven by
+back-to-back `debug.write_vio_probe` calls (write 1, write 0) can
+take effect for only a handful of fabric clocks on the receiving
+side — not enough cycles for some downstream logic to register the
+change.
+
+Concrete case that bit one trial: asserting a synchronous `rst` via
+a 100 ms VIO pulse left an FIR filter's shift register holding stale
+samples from the previous run. Holding `rst` high for **2 full
+seconds** before dropping it cleared the register cleanly. The
+specific number isn't magic, but **~1 second** is a safer floor for
+any VIO-driven control pulse than the millisecond timing that feels
+natural from a host script.
+
+Practical recipe for a clean reset / start sequence:
+
+```bash
+# Assert rst and wait visibly — Sleep / time.sleep on the host side.
+echo '{"op":"debug.write_vio_probe","params":{"probe":"rst","value":1}}' \
+    | python <bridge>/scripts/vivado_op.py
+sleep 1                              # PowerShell: Start-Sleep -Seconds 1
+echo '{"op":"debug.write_vio_probe","params":{"probe":"rst","value":0}}' \
+    | python <bridge>/scripts/vivado_op.py
+
+# Same idea for a "start" pulse: write 1, sleep ~1s, write 0.
+```
+
+If you find yourself wanting a single-cycle pulse, generate it in
+HDL instead (e.g. a rising-edge detector on a VIO bit that latches
+for one clock). Driving cycle-precise timing from VIO is fighting
+the tool — VIO is for human-rate state changes; ILA + a clock-domain
+internal pulse generator is for cycle-precise stimulus.
 
 ## 4. Verification by loopback
 
@@ -258,7 +293,7 @@ Vivado's dashboard caches the last commanded `OUTPUT_VALUE` -- if you
 read only the output, you see what you tried to write, not what the
 fabric received.
 
-`debug.read_vio_probes_all(client)` reads every input probe in one
+`debug.read_vio_probes_all` reads every input probe in one
 call and returns a `{name: value}` dict, which is convenient for
 this pattern.
 
@@ -297,17 +332,18 @@ VIO hardware (UG908). The size of the accumulation window is set by
 
 ### Reading activity reliably
 
-`debug.read_vio_probe(...)` only returns `INPUT_VALUE`, not activity.
-Until the bridge gets a dedicated helper, use raw Tcl:
+`debug.read_vio_probe` only returns `INPUT_VALUE`, not activity.
+Until the bridge gets a dedicated helper, drop through the
+`exec_tcl.py` escape hatch:
 
-```python
-c.exec_tcl(
-  'refresh_hw_vio [get_hw_vios hw_vio_1]')        # baseline + clear
-import time; time.sleep(observe_seconds)          # let signal run
-r = c.exec_tcl(
-  'concat '
-  'V=[get_property INPUT_VALUE    [get_hw_probes <name> -of [get_hw_vios hw_vio_1]]] '
-  'A=[get_property ACTIVITY_VALUE [get_hw_probes <name> -of [get_hw_vios hw_vio_1]]]')
+```bash
+# 1. Baseline + clear.
+python exec_tcl.py "refresh_hw_vio [get_hw_vios hw_vio_1]"
+
+# 2. Let the signal run (sleep host-side, e.g. `sleep 1` or `Start-Sleep 1`).
+
+# 3. Read INPUT_VALUE and ACTIVITY_VALUE together.
+python exec_tcl.py "concat V=[get_property INPUT_VALUE [get_hw_probes <name> -of [get_hw_vios hw_vio_1]]] A=[get_property ACTIVITY_VALUE [get_hw_probes <name> -of [get_hw_vios hw_vio_1]]]"
 ```
 
 Two observations from real bring-up:
@@ -369,13 +405,13 @@ an existing custom layout you'd prefer to keep.
 
 | Task | Call |
 |---|---|
-| List all probes (and find runtime names) | `debug.list_vio_probes(c)` |
-| Read one probe | `debug.read_vio_probe(c, probe="...")` |
-| Read all input probes at once | `debug.read_vio_probes_all(c)` |
-| Drive an output probe (HEX) | `debug.write_vio_probe(c, probe="...", value="A")` |
-| Read activity | raw Tcl, see section 5 |
-| Reset activity (INFINITE persistence) | `c.exec_tcl("reset_hw_vio_activity [get_hw_vios hw_vio_1]")` |
-| Reset all output probes to init values | `c.exec_tcl("reset_hw_vio_outputs [get_hw_vios hw_vio_1]")` |
+| List all probes (and find runtime names) | `{"op":"debug.list_vio_probes","params":{}}` |
+| Read one probe | `{"op":"debug.read_vio_probe","params":{"probe":"..."}}` |
+| Read all input probes at once | `{"op":"debug.read_vio_probes_all","params":{}}` |
+| Drive an output probe (HEX) | `{"op":"debug.write_vio_probe","params":{"probe":"...","value":"A"}}` |
+| Read activity | `exec_tcl.py` escape hatch, see section 5 |
+| Reset activity (INFINITE persistence) | `python exec_tcl.py "reset_hw_vio_activity [get_hw_vios hw_vio_1]"` |
+| Reset all output probes to init values | `python exec_tcl.py "reset_hw_vio_outputs [get_hw_vios hw_vio_1]"` |
 
 ## 8. References
 

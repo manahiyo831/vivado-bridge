@@ -126,9 +126,9 @@ mistake entirely: the caller always tells `sim.run` the
 maximum sim time, and `sim.run` always tells the caller whether
 that cap fired.
 
-To "run for another 100 µs", call `sim.run(c, sim_time_us=100,
-reuse=True)`. Composition lives in the caller, not inside the
-helper.
+To "run for another 100 µs", call `sim.run` again with
+`sim_time_us=100` and `reuse=true`. Composition lives in the caller,
+not inside the helper.
 
 ### Pre-flight check: don't pile sims on top of each other
 
@@ -189,8 +189,8 @@ nothing actually launched because of a pre-flight refusal) — read
 
 If `sim.run` reports an error and you want a clean slate:
 
-```python
-sim.close_sim(c, force=True)
+```bash
+python vivado_op.py '{"op":"sim.close_sim","params":{"force":true}}'
 ```
 
 Then fix the testbench (see "The testbench rules" above) and re-run.

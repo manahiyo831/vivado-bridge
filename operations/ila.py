@@ -92,8 +92,18 @@ def list_ila_probes(
     full_names = raw.split()
     probes: list[dict[str, Any]] = []
     for full in full_names:
-        # `get_hw_probes` returns names like "hw_ila_1/count".
-        short = full.rsplit("/", 1)[-1]
+        # `get_hw_probes` returns the probe path as it appears on the
+        # hw_ila object. For most probes that is just the bare name
+        # (`count`, `valid_in`); when the probe was wired to a net
+        # inside a sub-instance during ILA insertion, the path keeps
+        # the hierarchy (`u_fir/valid_out`). Keep the full string —
+        # downstream `get_hw_probes <name> -of_objects [get_hw_ilas
+        # <ila>]` lookups need the exact same string the hw_probe was
+        # created with. Stripping the path with rsplit was an earlier
+        # mistake that silently broke set_triggers on hierarchical
+        # probes (the rewrite of the IS_TRIGGER set with a `-XX`
+        # don't-care found no probe to write to).
+        short = full
         # The actual property names on a runtime hw_probe:
         #   WIDTH                  -- bit width (NOT PORT_WIDTH; that
         #                             property does not exist on

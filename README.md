@@ -39,22 +39,25 @@ concrete examples to set expectations:
 
 ## Operations at a glance
 
-Over **40 high-level Python operations** are available. The table
-below shows the categories with a representative summary; the full
-detail lives in `references/op_*.md`.
+The SKILL exposes **45 high-level operations** through a single CLI
+entry point: `scripts/vivado_op.py`. Send a JSON request on stdin,
+get a JSON response on stdout. The categories:
 
 | Category    | What it covers |
 |---|---|
-| project     | Project metadata snapshot |
-| build       | Launching and observing synth/impl runs, bitstream lookup, timing-summary parsing |
-| hardware    | Hardware Manager, JTAG target control, device programming |
-| debug (VIO) | VIO probe enumeration and read/write, with atomic batch writes |
-| ila         | ILA configure / set_triggers / arm / wait / export CSV / parse |
-| sim         | xsim driver with bounded run loop, simulate.log summary |
-| bridge      | Locating `vivado.log` / `vivado.jou` |
+| `project.*`  | Project metadata snapshot |
+| `build.*`    | Launching and observing synth/impl runs, bitstream lookup, timing-summary parsing |
+| `hardware.*` | Hardware Manager, JTAG target control, device programming |
+| `debug.*`    | VIO probe enumeration and read/write, with atomic batch writes; build-time VIO/ILA core helpers |
+| `ila.*`      | ILA configure / set_triggers / arm / wait / export CSV / parse |
+| `sim.*`      | xsim driver with bounded run loop, simulate.log summary |
+| `bridge.*`   | Locating `vivado.log` / `vivado.jou` |
 
-In addition, Claude Code can drop through to `client.exec_tcl(...)`
-for arbitrary Tcl when no operation covers what it needs to do.
+Full detail lives in `references/op_*.md`. Enumerate every registered
+op with `python scripts/vivado_op.py --list`.
+
+For raw Tcl when no op covers what you need, `scripts/exec_tcl.py`
+is the escape hatch.
 
 ## Tested environment
 

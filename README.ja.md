@@ -26,19 +26,21 @@ ClaudeCodeの機能活用により応用範囲はアイデア次第で無限大�
 
 ## 主な機能
 
-Python から呼べる高レベル API を **40 種以上** 用意しています。以下はカテゴリと代表的な機能の抜粋です。
+SKILL は **45 種類の高レベル operation** を、単一の CLI エントリポイント `scripts/vivado_op.py` から呼び出せる形で提供しています。標準入力に JSON リクエストを渡すと、標準出力に JSON レスポンスが返ってきます。カテゴリ一覧:
 
 | カテゴリ | 主な機能 |
 |---|---|
-| project    | プロジェクト情報の取得 |
-| build      | 合成・実装の起動と監視、bitstream 取得、タイミング解析 |
-| hardware   | Hardware Manager 操作、JTAG ターゲット制御、デバイス書き込み |
-| debug (VIO)| VIO probe の列挙・読み書き、複数 probe の atomic 書き込み |
-| ila        | ILA の configure / set_triggers / arm / wait / CSV エクスポート・パース |
-| sim        | xsim による testbench 実行、ログ要約 |
-| bridge     | Vivado ログファイルのパス特定 |
+| `project.*`  | プロジェクト情報の取得 |
+| `build.*`    | 合成・実装の起動と監視、bitstream 取得、タイミング解析 |
+| `hardware.*` | Hardware Manager 操作、JTAG ターゲット制御、デバイス書き込み |
+| `debug.*`    | VIO probe の列挙・読み書き、複数 probe の atomic 書き込み、ビルド時の VIO/ILA core helper |
+| `ila.*`      | ILA の configure / set_triggers / arm / wait / CSV エクスポート・パース |
+| `sim.*`      | xsim による testbench 実行、ログ要約 |
+| `bridge.*`   | Vivado ログファイルのパス特定 |
 
-このほか、API に頼らない任意の Tcl コマンドを直接実行する方法も用意しており、Claude Code が 直接 Tcl コマンドを実行したいときに使用できます。
+詳細は `references/op_*.md` を参照してください。登録 op の一覧は `python scripts/vivado_op.py --list` で取得できます。
+
+operation でカバーされていない任意の Tcl コマンドを実行したい場合は、`scripts/exec_tcl.py` を escape hatch として使えます。
 
 ## 動作確認環境
 

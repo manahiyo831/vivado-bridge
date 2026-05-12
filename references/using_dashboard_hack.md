@@ -120,31 +120,27 @@ display name (with `[hi:lo]` suffix on buses).
 
 ## Workflow
 
-```python
-from vivado_bridge_client import Client
-from operations import hardware
-import subprocess, json
+The full cycle is: flush Vivado's in-memory HW Manager state, edit
+the project files outside Vivado, then re-open and refresh. Each
+step is one dispatcher call (or one subprocess invocation for the
+file edit):
 
-c = Client.connect()
-
+```bash
 # 1. Flush whatever Vivado has in memory.
-hardware.close_hardware_target(c)
-c.exec_tcl("close_hw_manager")
+python vivado_op.py '{"op":"hardware.close_hardware_target","params":{}}'
+python exec_tcl.py "close_hw_manager"
 
 # 2. Edit hw.xml + wcfg from outside.
-subprocess.run([
-    "python",
-    "<bridge>/scripts/setup_dashboard.py",
-    "<project>/project_1.hw/hw_1/hw.xml",
-    "--config", "my_layout.json",
-], check=True)
+python <bridge>/scripts/setup_dashboard.py \
+    <project>/project_1.hw/hw_1/hw.xml \
+    --config my_layout.json
 
 # 3. Re-open. The new layout is picked up.
-hardware.open_hw_manager(c)
-hardware.connect_hw_server(c)
-hardware.open_hardware_target(c, force_refresh=True)
-hardware.open_hardware_device(c, device_filter="xc7")
-c.exec_tcl("refresh_hw_device [current_hw_device]")
+python vivado_op.py '{"op":"hardware.open_hw_manager","params":{}}'
+python vivado_op.py '{"op":"hardware.connect_hw_server","params":{}}'
+python vivado_op.py '{"op":"hardware.open_hardware_target","params":{"force_refresh":true}}'
+python vivado_op.py '{"op":"hardware.open_hardware_device","params":{"device_filter":"xc7"}}'
+python exec_tcl.py "refresh_hw_device [current_hw_device]"
 ```
 
 The user sees the new layout immediately after step 3. No clicks
@@ -168,7 +164,7 @@ required.
 
 Order of entries = display order on the dashboard / pane. Either
 list can be empty (skip that pane). Names must match exactly what
-`debug.list_vio_probes(c)` and the ILA `<probe>` `<nets>` sections
+`debug.list_vio_probes` and the ILA `<probe>` `<nets>` sections
 report at runtime; don't guess from the IP-port names.
 
 A complete example lives at

@@ -780,8 +780,8 @@ def export_csv(
 # ---------------------------------------------------------------------------
 
 def parse_csv(
-    csv_path: str | Path,
     *,
+    path: str | Path,
     signed_columns: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Parse a Vivado-exported ILA CSV into header + decoded rows.
@@ -811,7 +811,7 @@ def parse_csv(
     """
     import csv as _csv
 
-    p = Path(csv_path)
+    p = Path(path)
     if not p.exists():
         # Surface this as a normal failure dict rather than letting
         # `p.open()` raise FileNotFoundError. Every other operation in

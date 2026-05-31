@@ -27,6 +27,7 @@ than as a document to read end-to-end.
 - [VIVADO-XSIM-*](#vivado-xsim-) — xsim simulator
 - [VIVADO-XDC-*](#vivado-xdc-) — XDC constraints
 - [VIVADO-AXIS-*](#vivado-axis-) — AXI-Stream interconnect
+- [HOST-POWERSHELL-*](#host-powershell-) — Windows PowerShell 5.1 host-shell hazards
 - [BRIDGE-*](#bridge-) — vivado-bridge SKILL usage
 
 ---
@@ -113,6 +114,84 @@ than as a document to read end-to-end.
   );
   ```
 - **Industry status**: a generic AXI-Stream gotcha, not Xilinx-specific. AMBA AXI4-Stream specification §2.2: a master must wait for `TREADY` before considering a beat consumed; downstream optimisers reasonably treat a permanently-unready channel as dead logic. Worth knowing whenever you wrap any AXIS-output IP.
+
+---
+
+## HOST-POWERSHELL-*
+
+These are host-shell hazards specific to Windows PowerShell 5.1
+(the default on Win 10/11). They do not affect WSL bash or other
+host shells, but they affect every caller driving `vivado_op.py` /
+`exec_tcl.py` from a PowerShell prompt -- which the skill's standard
+recipe assumes.
+
+### HOST-POWERSHELL-001: `>` redirect writes UTF-16, Vivado reads UTF-8
+
+- **Symptom**: A response captured with
+  `python vivado_op.py > out.json` looks fine in Notepad but downstream
+  parsers (`json.loads` / Vivado `$readmemh` / `add_files`) choke on
+  invisible BOM / wide-char bytes. The file size is roughly 2x what
+  you'd expect from the visible content.
+- **Cause**: PS 5.1's `>` operator uses `Out-File` semantics, which
+  default to `Unicode` (UTF-16 LE with BOM) regardless of what the
+  source process emitted.
+- **Correct approach**:
+  - Pipe through Python and have Python write the file
+    (`python ... | python -c "import sys, pathlib;
+    pathlib.Path('out.json').write_text(sys.stdin.read(),
+    encoding='utf-8')"`).
+  - Or use `[System.IO.File]::WriteAllText` with an explicit BOM-less
+    encoder: `New-Object System.Text.UTF8Encoding $false` (the
+    no-arg constructor adds a BOM; the `$false` is the
+    `encoderShouldEmitUTF8Identifier` flag).
+  - `Set-Content -Encoding utf8` / `Out-File -Encoding utf8` on PS 5.1
+    **both still emit a BOM** despite the name. PS 7+ fixed this, but
+    PS 5.1 is what ships on Windows.
+  - On the Python read side, opening with `encoding='utf-8-sig'`
+    tolerates a stray BOM if you can't control the writer.
+
+### HOST-POWERSHELL-002: `$var` inside `exec_tcl.py "..."` is expanded by PowerShell
+
+- **Symptom**: `python exec_tcl.py "get_nets -of [get_pins $top/clk]"`
+  resolves `$top` to empty before Tcl ever sees it, producing a pin
+  path like `/clk` that matches nothing.
+- **Cause**: PowerShell's double-quoted string interpolation runs
+  before the executable is launched. Tcl's `$top` is meaningful to
+  Tcl but invisible to PowerShell, so PS replaces it with the value
+  of `$top` from its own scope (typically empty).
+- **Correct approach**:
+  - Use single quotes (`'...'`) when the Tcl snippet contains literal
+    `$`: `python exec_tcl.py 'get_nets -of [get_pins $top/clk]'`.
+    Single-quoted strings disable PS interpolation entirely.
+  - Or write the Tcl to a `.tcl` file and source it:
+    `python exec_tcl.py "source D:/path/to/snippet.tcl"` (no `$`
+    crosses the PS quoting boundary).
+  - Prefer the `.tcl` file route for any multi-line snippet — single-
+    quoted strings cannot contain other single quotes, and
+    backtick-escaped `$` inside double quotes is brittle.
+
+### HOST-POWERSHELL-003: Vivado progress lines contaminate JSON stdout
+
+- **Symptom**: A naive `json.loads(stdout)` raises `JSONDecodeError`
+  on output from `sim.run` / `build.synthesize` / similar long ops.
+  The actual JSON response is correct; it just isn't on the first
+  line of stdout.
+- **Cause**: When Vivado is in the middle of a long-running operation,
+  it emits progress lines (`[synth_1] Queued ... [synth_1]
+  synth_design Complete!`) to stdout, sometimes with carriage-return
+  re-paint sequences. The dispatcher's JSON line is appended after
+  those progress lines, not at the start.
+- **Correct approach**:
+  ```python
+  idx = stdout.find('{')
+  if idx < 0:
+      raise RuntimeError(f"no JSON object in stdout: {stdout!r}")
+  result = json.loads(stdout[idx:])
+  ```
+  In practice the first `{` reliably marks the start of the JSON
+  response (Vivado's progress lines don't contain `{`). Don't try to
+  strip line-by-line: the progress output sometimes lacks newlines
+  between fragments.
 
 ---
 

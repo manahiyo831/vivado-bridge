@@ -26,14 +26,14 @@ ClaudeCodeの機能活用により応用範囲はアイデア次第で無限大�
 
 ## 主な機能
 
-SKILL は **45 種類の高レベル operation** を、単一の CLI エントリポイント `scripts/vivado_op.py` から呼び出せる形で提供しています。標準入力に JSON リクエストを渡すと、標準出力に JSON レスポンスが返ってきます。カテゴリ一覧:
+SKILL は **48 種類の高レベル operation** を、単一の CLI エントリポイント `scripts/vivado_op.py` から呼び出せる形で提供しています。標準入力に JSON リクエストを渡すと、標準出力に JSON レスポンスが返ってきます。カテゴリ一覧:
 
 | カテゴリ | 主な機能 |
 |---|---|
-| `project.*`  | プロジェクト情報の取得 |
-| `build.*`    | 合成・実装の起動と監視、bitstream 取得、タイミング解析 |
+| `project.*`  | プロジェクト情報の取得、`add_sources` による「add files + set top + update compile order」一括処理 |
+| `build.*`    | 合成・実装の起動と監視、bitstream 取得、タイミング解析、リソース利用 (LUT/FF/DSP/BRAM) 要約 |
 | `hardware.*` | Hardware Manager 操作、JTAG ターゲット制御、デバイス書き込み |
-| `debug.*`    | VIO probe の列挙・読み書き、複数 probe の atomic 書き込み、ビルド時の VIO/ILA core helper |
+| `debug.*`    | VIO probe の列挙・読み書き、複数 probe の atomic 書き込み、ビルド時の VIO/ILA core helper、`find_clock_net` / `verify_probe_nets` による ILA 挿入前準備 |
 | `ila.*`      | ILA の configure / set_triggers / arm / wait / CSV エクスポート・パース |
 | `sim.*`      | xsim による testbench 実行、ログ要約 |
 | `bridge.*`   | Vivado ログファイルのパス特定 |

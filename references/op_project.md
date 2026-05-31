@@ -3,11 +3,11 @@
 All operations are invoked via the `vivado_op.py` JSON dispatcher.
 See [SKILL.md](../SKILL.md) for the invocation pattern.
 
-Read-only metadata snapshot of the open Vivado project. This module
-does not edit projects -- creating, adding sources, or switching the
-top module are tasks the user typically does in the GUI before
-sourcing the bridge. If you need them in code, drop through the
-`exec_tcl.py` escape hatch.
+Project-level operations: read the open project's metadata, and
+add files / set the top module / refresh compile order via
+`project.add_sources`. Creating / deleting projects is still done
+through `exec_tcl` (the typical session uses one project for a
+long time, so a dedicated helper would not pay for itself).
 
 ## Common shape
 
@@ -83,3 +83,75 @@ open at all.
 | `error_kind` | When |
 |---|---|
 | `not_found` | No project is open. Open or create a project before calling this op. |
+
+### project.add_sources
+
+Bundle the standard "add files + set top + update compile order"
+boilerplate that begins almost every project-driven workflow. Pass
+only the file lists you actually have; missing keys default to no-op.
+
+Request:
+
+```json
+{"op": "project.add_sources", "params": {
+  "hdl":     ["hdl/foo.v", "hdl/bar.v"],
+  "constrs": ["xdc/top.xdc"],
+  "sim":     ["sim/tb_foo.v"],
+  "top":     "foo_top",
+  "sim_top": "tb_foo",
+  "update_order": true
+}}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "Added 2 HDL, 1 constr, 1 sim file(s); top=foo_top; sim_top=tb_foo",
+  "hdl_added":     ["hdl/foo.v", "hdl/bar.v"],
+  "constrs_added": ["xdc/top.xdc"],
+  "sim_added":     ["sim/tb_foo.v"],
+  "top":     "foo_top",
+  "sim_top": "tb_foo",
+  "warnings": []
+}
+```
+
+Parameters (all optional):
+
+- `hdl`           paths added to fileset `sources_1` (RTL design).
+- `constrs`       paths added to fileset `constrs_1` (XDC etc.).
+- `sim`           paths added to fileset `sim_1` (testbenches /
+                  sim-only models). The `sim_1` fileset is created on
+                  demand if it does not already exist.
+- `top`           if given, sets `top` on `current_fileset` (= the
+                  synthesizable top module).
+- `sim_top`       if given, sets `top` on `get_filesets sim_1` (= the
+                  simulation top module).
+- `update_order`  default `true`. When `true`, calls
+                  `update_compile_order -fileset sources_1` (and the
+                  same for `sim_1` if any sim file or `sim_top` was
+                  involved) after the adds.
+
+Paths may be absolute or relative to Vivado's current working
+directory (typically the project root). They are forwarded to
+`add_files` verbatim, which silently tolerates re-adds of files
+already in the fileset.
+
+#### Notes
+
+- The op records a `warnings` entry for any **absolute** path that
+  does not exist on disk at op time. Relative paths are not checked
+  (Vivado resolves them against its own cwd, which the caller may not
+  share). A successful op does NOT guarantee that `top` resolves to
+  a real module — that check happens at elaboration / synth time.
+- Re-running this op with the same file lists is safe; Vivado treats
+  duplicates as no-ops.
+
+#### Failure modes
+
+| `error_kind` | When |
+|---|---|
+| `no_project`  | No project is open. Open or create a project first. |
+| `tcl_failure` | A specific Tcl call failed (e.g. invalid path characters). Inspect the surrounding `message` for the offending command. |

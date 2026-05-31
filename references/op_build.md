@@ -55,6 +55,10 @@ whether you can program now.
   "bit_exists": true, "ltx_exists": true,
   "wns": 0.231, "tns": 0.0, "met_timing": true,
   "timing_report_path": ".../impl_1/blink_timing_summary_routed.rpt",
+  "utilization_report_path": ".../impl_1/blink_utilization_placed.rpt",
+  "luts": 1868, "lut_logic": 1682, "lut_memory": 186,
+  "ffs": 3246, "dsps": 0,
+  "bram_tile": 9.5, "bram_36": 9, "bram_18": 1,
   "ready_to_program": true
 }
 ```
@@ -83,6 +87,37 @@ Three-way truth value, on purpose:
             yet (e.g. impl hasn't finished, or Vivado changed the
             report layout). Don't paper over this with "if not met_timing"
             -- "missing" and "failed" mean different things.
+
+#### Utilization fields
+
+`build.summary` also pulls the headline resource counts from the
+placed utilization report (`*_utilization_placed.rpt`) so the caller
+can answer "did the design fit / use the resources I expected?"
+without separately invoking `report_utilization`.
+
+| Field         | Meaning |
+|---|---|
+| `luts`        | Total Slice LUTs |
+| `lut_logic`   | LUTs used as combinational logic |
+| `lut_memory`  | LUTs used as distributed RAM / SRL (subtype breakdown of `luts`) |
+| `ffs`         | Slice Registers (Flip-Flops + Latches; latches are rare) |
+| `dsps`        | DSP48 blocks |
+| `bram_tile`   | Block RAM tiles (may be fractional, e.g. 9.5 = nine 36k + one 18k) |
+| `bram_36`     | RAMB36 blocks specifically |
+| `bram_18`     | RAMB18 blocks specifically |
+| `utilization_report_path` | Absolute path to the parsed report |
+
+Each numeric field is `null` (not `0`) when the row was not found in
+the report. "Missing row" most commonly means "the design has none
+of that resource and Vivado omitted the row entirely" — for example,
+a DSP-free design typically still shows a `DSPs` row at `0`, but
+designs that touch no BRAM may omit `RAMB18` altogether. Callers
+that want to assert "exactly 0 DSPs" should treat `null` and `0` as
+equivalent for that purpose; callers debugging "why didn't this
+metric show up?" should branch on `null` separately.
+
+The full report is at `utilization_report_path` for callers who need
+more detail than the headline fields surface.
 
 ### build.get_active_runs
 

@@ -116,6 +116,111 @@ def _timing_summary_for_run_dir(run_dir: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Utilization report parsing
+# ---------------------------------------------------------------------------
+#
+# The placed utilization report (*_utilization_placed.rpt) is a flat
+# series of `| metric_name | used | fixed | prohibited | available | pct |`
+# rows under titled sections. We pull the small set of headline metrics
+# that "did the design fit / use the resources we expected?" callers
+# typically want -- LUTs, FFs, DSPs, BRAMs, LUTRAM. The full report
+# stays readable for users who want to dig deeper; `build.summary`
+# just surfaces the totals.
+#
+# Names match the row labels in Vivado 2024.1 for a 7-series part.
+
+_UTIL_ROW_RE = re.compile(
+    r"^\|\s*([^|]+?)\s*\|\s*([\d.]+)\s*\|"
+)
+
+_UTIL_METRICS: dict[str, str] = {
+    "Slice LUTs": "luts",
+    "LUT as Logic": "lut_logic",
+    "LUT as Memory": "lut_memory",
+    "Slice Registers": "ffs",
+    "Block RAM Tile": "bram_tile",
+    "RAMB36/FIFO*": "bram_36",
+    "RAMB18": "bram_18",
+    "DSPs": "dsps",
+}
+
+
+def _parse_utilization_report(rpt_path: Path) -> dict[str, Any] | None:
+    """Extract the headline resource counts from a `*_utilization_placed.rpt`.
+
+    Returns a dict mapping the keys in `_UTIL_METRICS.values()` to ints
+    (or floats for fractional Block-RAM-Tile counts). Returns None if
+    the file cannot be read. Missing rows leave their fields as None,
+    which lets callers distinguish "we did not find this metric in the
+    report" from "the metric is zero". (For example, RAMB18 is omitted
+    when the design uses none, which is the common case.)
+    """
+    if not rpt_path.exists():
+        return None
+    try:
+        text = rpt_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    found: dict[str, Any] = {v: None for v in _UTIL_METRICS.values()}
+    for line in text.splitlines():
+        m = _UTIL_ROW_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if name not in _UTIL_METRICS:
+            continue
+        key = _UTIL_METRICS[name]
+        if found[key] is not None:
+            # A metric name can reappear in a sub-breakdown section
+            # ("Slice LUTs" shows up in both the headline and the
+            # detail table). Keep the first occurrence, which is the
+            # headline row.
+            continue
+        raw = m.group(2)
+        try:
+            val: Any = int(raw) if "." not in raw else float(raw)
+        except ValueError:
+            continue
+        found[key] = val
+    return found
+
+
+def _utilization_summary_for_run_dir(run_dir: Path) -> dict[str, Any]:
+    """Look up the placed-utilization summary for an impl run directory.
+
+    Mirrors `_timing_summary_for_run_dir` in spirit: always returns a
+    fixed-shape dict; values are None when the report isn't available
+    yet. The metric values are integers (or floats for the fractional
+    Block-RAM-Tile case); a None value means "row was not found in
+    the report" -- *not* "metric is zero". Callers that want a
+    zero-or-positive sentinel should branch on None explicitly.
+    """
+    candidates = sorted(run_dir.glob("*_utilization_placed.rpt"))
+    rpt_path = candidates[0] if candidates else None
+    base = {
+        "utilization_report_path": None,
+        "luts": None,
+        "lut_logic": None,
+        "lut_memory": None,
+        "ffs": None,
+        "bram_tile": None,
+        "bram_36": None,
+        "bram_18": None,
+        "dsps": None,
+    }
+    if rpt_path is None:
+        return base
+    parsed = _parse_utilization_report(rpt_path)
+    if parsed is None:
+        base["utilization_report_path"] = str(rpt_path)
+        return base
+    base["utilization_report_path"] = str(rpt_path)
+    base.update(parsed)
+    return base
+
+
+# ---------------------------------------------------------------------------
 # active-run resolution
 # ---------------------------------------------------------------------------
 
@@ -190,6 +295,7 @@ def summary(client) -> dict[str, Any]:
     impl_dir = bs.get("impl_dir") if bs["success"] else None
     if impl_dir:
         timing = _timing_summary_for_run_dir(Path(impl_dir))
+        utilization = _utilization_summary_for_run_dir(Path(impl_dir))
     else:
         timing = {
             "timing_report_path": None,
@@ -197,7 +303,19 @@ def summary(client) -> dict[str, Any]:
             "tns": None,
             "met_timing": None,
         }
+        utilization = {
+            "utilization_report_path": None,
+            "luts": None,
+            "lut_logic": None,
+            "lut_memory": None,
+            "ffs": None,
+            "bram_tile": None,
+            "bram_36": None,
+            "bram_18": None,
+            "dsps": None,
+        }
     out.update(timing)
+    out.update(utilization)
 
     out["ready_to_program"] = bool(
         out["impl_complete"] and not out["impl_failed"] and out["bit_exists"]
@@ -209,12 +327,18 @@ def summary(client) -> dict[str, Any]:
         timing_str = f"TIMING FAILED (WNS={out['wns']:.3f}, TNS={out['tns']:.3f})"
     else:
         timing_str = "timing=?"
+    if out["luts"] is not None:
+        util_str = (
+            f", luts={out['luts']}, ffs={out['ffs']}, dsps={out['dsps']}"
+        )
+    else:
+        util_str = ""
     msg = (
         f"synth={out['synth_status'] or 'none'}, "
         f"impl={out['impl_status'] or 'none'}, "
         f"bit={'yes' if out['bit_exists'] else 'no'}, "
         f"{timing_str}, "
-        f"ready_to_program={out['ready_to_program']}"
+        f"ready_to_program={out['ready_to_program']}{util_str}"
     )
     return ok(msg, client=client, **out)
 

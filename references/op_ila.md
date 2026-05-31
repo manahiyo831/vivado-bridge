@@ -272,10 +272,15 @@ Request:
 
 ```json
 {"op": "ila.parse_csv", "params": {
-  "csv_path": "results/capture.csv",
+  "path": "results/capture.csv",
   "signed_columns": {"fir_out": 16, "sp_obs": 32}
 }}
 ```
+
+The `path` keyword matches `ila.export_csv`'s `path` argument so the
+two ops compose cleanly. The response still echoes the path as
+`csv_path` (kept for backwards compatibility with parsers that already
+read that field).
 
 Response:
 
@@ -368,7 +373,7 @@ python vivado_op.py '{"op":"ila.wait_for_capture","params":{"timeout":5.0}}'
 python vivado_op.py '{"op":"ila.export_csv","params":{"path":"results/capture.csv"}}'
 
 # Analyse without Vivado:
-python vivado_op.py '{"op":"ila.parse_csv","params":{"csv_path":"results/capture.csv","signed_columns":{"fir_out":16}}}'
+python vivado_op.py '{"op":"ila.parse_csv","params":{"path":"results/capture.csv","signed_columns":{"fir_out":16}}}'
 ```
 
 Branch on `success` between steps: if `ila.wait_for_capture` returns

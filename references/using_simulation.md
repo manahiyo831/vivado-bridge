@@ -208,3 +208,87 @@ and Ctrl+C there -- that path bypasses the bridge entirely.
   it host-side).
 - It does not call `wait_on_run` or `wait_on_runs`. Those are blocking
   Tcl calls and would re-introduce the very hang this module avoids.
+
+## Stimulus design patterns
+
+When you verify against a Python gold model — the dominant use case
+for this skill — you often need **the same input data** in three
+places: the Python model (to compute expected outputs), the
+SystemVerilog TB (to drive the DUT in simulation), and an HDL ROM
+(to drive the DUT on real hardware in a VIO-triggered sweep, see
+[using_ila.md "Sweeping a known input pattern"](using_ila.md#sweeping-a-known-input-pattern-via-vio-triggered-hdl-sequencer)).
+
+Keeping three independently-written copies in sync is a classic
+drift source: change the sine amplitude in Python, forget to update
+the ROM literals, and the symptom is "sim and HW disagree" with no
+obvious cause.
+
+### Pattern: Python emits the HDL `.mem` file
+
+One robust way to eliminate drift is to have Python emit a
+`$readmemh`-format file and have both HDL sides `$readmemh` it. Then
+the same 256 bytes are physically the source of truth for Python,
+TB, and RTL ROM — changing one place changes all three.
+
+```python
+# python/foo_ref.py — one place, three uses
+inputs = [...]                                # define once
+with open("hdl/inputs.mem", "w") as f:
+    for v in inputs:
+        f.write(f"{v & 0xFFFF:04x}\n")        # 4-hex-digit lines
+
+expected = [compute_gold(inputs, i) for i in range(len(inputs))]
+# expected goes to JSON for the host-side comparator
+```
+
+```verilog
+// RTL ROM (synthesised, also used on real HW)
+reg [15:0] rom [0:255];
+initial $readmemh("inputs.mem", rom);
+
+// TB sees the same data via the same file
+reg [15:0] tb_rom [0:255];
+initial $readmemh("inputs.mem", tb_rom);
+```
+
+The file format is `$readmemh`'s standard: one hex value per line,
+no `0x` prefix, optional `@` address directives. Vivado's `add_files`
+treats `.mem` as a sim/synth source — it gets bundled into the
+project and finds its way to both xsim and the placed bitstream.
+
+This is a recommended pattern, not a requirement. Designs whose
+input is a free-running counter or LFSR don't need a `.mem` file at
+all; designs whose input is a small literal list may be fine with
+hand-copied values. The pattern earns its keep when the input set
+is large enough that hand-coding it is error-prone, **and** you
+intend to compare HDL against a Python gold model at the bit-exact
+level.
+
+## xsim quirk: last `$display` before `$finish` can be truncated
+
+Vivado 2024.1's xsim does not reliably flush stdout before
+`$finish`: the **last `$display` (or `$write`) line right before
+`$finish`** sometimes lands in `simulate.log` truncated mid-line, or
+never appears at all. `$fflush` does not fix it. Inserting padding
+clocks before `$finish` does not fix it either. The exact cut point
+varies per run.
+
+This breaks the natural pattern of "print a final `RESULT_TAIL`
+summary line right before `$finish`": readers and grep-based parsers
+miss the tail.
+
+Two workarounds, both reliable:
+
+1. **Dump verification data via `$writememh` / `$fwrite + $fclose`,
+   not `$display`.** File output is properly flushed at end-of-sim.
+   Read the file from the host comparator alongside the captured
+   `result["warnings"]` lines.
+2. **Print the critical summary line earlier**, with at least one
+   benign `$display` (e.g. `"sim ending"`) BETWEEN the summary and
+   `$finish`. Vivado is happy to drop the benign tail; the summary
+   you actually need has already landed.
+
+If you only need a single PASS/FAIL boolean at end-of-sim, option 2
+is the simplest. If you need a large dump (per-cycle vectors), use
+option 1 — `$writememh "results/sim_out.hex", mem;` is the standard
+recipe.

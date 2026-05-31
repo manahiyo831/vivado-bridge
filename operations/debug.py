@@ -1,8 +1,17 @@
-"""Debug-core operations: VIO IP creation, read/write VIO probes.
+"""Debug-core operations: VIO IP creation, read/write VIO probes,
+ILA-prep helpers.
 
 Build-time:
   - `create_vio(...)` adds a VIO IP to the project from a structured
     description (output / input probe lists with widths and inits).
+  - `create_ila_core(...)` synthesises and inserts an ILA core
+    against an open synthesized design.
+  - `find_clock_net(...)` resolves the post-synth net name behind a
+    top-level clock port (the value `create_ila_core` needs as its
+    `clock_net` argument).
+  - `verify_probe_nets(...)` checks that a list of net names exist
+    in the current netlist before passing them to `create_ila_core`
+    (which otherwise tolerates missing nets silently).
 
 Runtime (after program_device):
   - `list_vios` / `list_vio_probes` enumerate cores and probes.
@@ -568,7 +577,26 @@ def create_vio(
                     "client_error",
                     f"{kind}_probe[{i}] width out of range [1..256]: {w}",
                 )
-            init = int(spec.get("init", 0)) if kind == "out" else 0
+            if kind == "out":
+                raw_init = spec.get("init", 0)
+                try:
+                    init = int(raw_init)
+                except (TypeError, ValueError):
+                    # Most common cause: caller passed a hex string
+                    # ("0xAA"). int() with no base argument rejects
+                    # "0x..." -- convert host-side if you want hex
+                    # semantics: int("0xAA", 16) == 170.
+                    return None, fail(
+                        "client_error",
+                        (
+                            f"out_probe[{i}] init must be a decimal int, "
+                            f"got {raw_init!r}. Hex strings like '0xAA' "
+                            f"are not accepted; convert host-side: "
+                            f"int('0xAA', 16) == 170."
+                        ),
+                    )
+            else:
+                init = 0
             if kind == "out" and (init < 0 or init >= (1 << w)):
                 return None, fail(
                     "client_error",
@@ -869,16 +897,55 @@ def create_ila_core(
                 "client_error",
                 f"probes[{i}] missing required 'name'.",
             )
-        if "nets" not in spec:
+
+        # Accept either:
+        #   "nets": "a b c"  (whitespace-separated str)
+        #   "nets": ["a", "b", "c"]
+        #   "bus_base": "foo", "bus_width": 32  (expand to foo[0]..foo[31])
+        #
+        # The bus_* shorthand is for the recurring case where
+        # callers would otherwise hand-write 32 individual entries for a wide bus.
+        if "bus_base" in spec or "bus_width" in spec:
+            if "nets" in spec:
+                return fail(
+                    "client_error",
+                    f"probes[{i}] ({spec['name']!r}): pass either "
+                    f"'nets' OR 'bus_base'+'bus_width', not both.",
+                )
+            if "bus_base" not in spec or "bus_width" not in spec:
+                return fail(
+                    "client_error",
+                    f"probes[{i}] ({spec['name']!r}): bus shorthand "
+                    f"requires both 'bus_base' (str) and 'bus_width' (int).",
+                )
+            base = str(spec["bus_base"])
+            try:
+                bwidth = int(spec["bus_width"])
+            except (TypeError, ValueError):
+                return fail(
+                    "client_error",
+                    f"probes[{i}] ({spec['name']!r}): 'bus_width' must "
+                    f"be an int, got {spec['bus_width']!r}.",
+                )
+            if bwidth < 1:
+                return fail(
+                    "client_error",
+                    f"probes[{i}] ({spec['name']!r}): 'bus_width' must "
+                    f"be >= 1, got {bwidth}.",
+                )
+            net_list = [f"{base}[{j}]" for j in range(bwidth)]
+        elif "nets" not in spec:
             return fail(
                 "client_error",
-                f"probes[{i}] ({spec['name']!r}) missing required 'nets'.",
+                f"probes[{i}] ({spec['name']!r}) missing required 'nets' "
+                f"(or 'bus_base'+'bus_width' shorthand).",
             )
-        nets = spec["nets"]
-        if isinstance(nets, str):
-            net_list = nets.split()
         else:
-            net_list = list(nets)
+            nets = spec["nets"]
+            if isinstance(nets, str):
+                net_list = nets.split()
+            else:
+                net_list = list(nets)
         if not net_list:
             return fail(
                 "client_error",
@@ -1334,6 +1401,217 @@ def delete_ila_core(
 # Use `from operations import ila`. This module deliberately does not
 # re-export `list_ilas` etc. so there is exactly one canonical entry
 # point for each ILA verb.
+
+
+# ---------------------------------------------------------------------------
+# ILA-prep helpers (open-synth-time)
+# ---------------------------------------------------------------------------
+
+def find_clock_net(
+    client,
+    *,
+    instance: str,
+    clock_port: str = "clk",
+) -> dict[str, Any]:
+    """Resolve the post-synth net driving a clock pin on an internal cell.
+
+    `create_ila_core` / `create_debug_core` want a net name like
+    `clk_125_IBUF_BUFG`, not the port name `clk` that appears in
+    your HDL. In a flat post-synth netlist the top-level port
+    `clk` is no longer addressable as `<top>/clk` — the
+    HDL top is unwrapped and only the leaf cells (and the IBUF/BUFG
+    insertion chain) survive. The reliable recipe is to point at the
+    `clk` pin of a known DUT instance under the top:
+
+        get_nets -of_objects [get_pins <instance>/<clock_port>]
+
+    This op wraps that recipe so it does not have to be re-typed
+    (and re-quoted through PowerShell, which expands `$` inside
+    double-quoted `exec_tcl.py "..."` arguments).
+
+    Requires the synthesized design to be open
+    (`build.open_synth(c)` first). The op does not auto-open it so
+    that session state changes stay explicit and visible.
+
+    Parameters:
+      instance    hierarchical instance path to a cell that consumes
+                  the clock. Typically the DUT instance directly under
+                  the top, e.g. "u_cordic", "u_core", "u_crc". For
+                  designs whose top module has logic of its own that
+                  uses `clk`, any internal register fed by the clock
+                  works ("hb_cnt_reg[0]" etc.).
+      clock_port  the clock pin name on `instance`. Defaults to "clk"
+                  since that's the overwhelming convention; override
+                  for designs that use "sys_clk" / "ACLK" / etc.
+
+    Returned fields:
+      net         the resolved net name (e.g. "clk_125_IBUF_BUFG")
+      candidates  the full list of nets returned by `get_nets`.
+                  Usually one element; a multi-element list indicates
+                  an unusual netlist (e.g. heavy clock buffer
+                  fan-out), in which case `net` is set to
+                  `candidates[0]` and a warning lists the ambiguity.
+
+    Failure modes:
+      no_open_synth   the synthesized design is not open. Call
+                      `build.open_synth(c)` first.
+      not_found       the pin or net could not be resolved. Verify
+                      the instance path and the clock-port name.
+                      Common cause: passing the HDL top module name
+                      (e.g. "foo_top") instead of an instance name
+                      (e.g. "u_foo") — the top is flattened and not
+                      addressable post-synth.
+    """
+    if not query_one(client, "current_design -quiet"):
+        return fail(
+            "no_open_synth",
+            "No design is open. Call build.open_synth(c) before debug.find_clock_net().",
+        )
+
+    pin_path = f"{instance}/{clock_port}"
+    raw = query_one(
+        client,
+        f"get_nets -quiet -of_objects [get_pins -quiet {tcl_str(pin_path)}]",
+    )
+    candidates = (raw or "").split()
+    warnings: list[str] = []
+
+    if not candidates:
+        return fail(
+            "not_found",
+            (
+                f"Could not resolve clock net for pin {pin_path!r}. "
+                "Verify the instance path and clock-port name. "
+                "Note: pass an internal instance name (e.g. 'u_foo'), "
+                "not the HDL top module name — the top is flattened "
+                "post-synth and is not addressable as '<top>/clk'."
+            ),
+        )
+
+    if len(candidates) > 1:
+        warnings.append(
+            f"Multiple nets matched pin {pin_path!r}: {candidates}. "
+            f"Returning the first ({candidates[0]!r})."
+        )
+
+    net = candidates[0]
+    return ok(
+        f"clock net = {net}",
+        client=client,
+        net=net,
+        candidates=candidates,
+        warnings=warnings,
+    )
+
+
+def verify_probe_nets(
+    client,
+    *,
+    nets: list,
+) -> dict[str, Any]:
+    """Check which net names exist in the current netlist.
+
+    `create_ila_core` and `create_debug_core` accept lists of net
+    names. If a net was optimised away (no fanout, dangling wire,
+    etc.) they connect it silently to nothing, and the discovery
+    happens later — usually at implementation, when the bitstream is
+    already half-built, or worse, at runtime when probes return
+    nonsense values.
+
+    Run this op against the list you plan to pass to `create_ila_core`
+    BEFORE you call it. Anything in `missing` will either need to be
+    kept alive in HDL (typically by adding it as a fanout-having
+    debug attribute on the driving register), corrected for typos,
+    or removed from the ILA probe list.
+
+    Parameters:
+      nets  list of entries. Each entry is either:
+            - a string net name, including bit-slice notation
+              (`foo/bar[7:0]`) which is forwarded to `get_nets` verbatim,
+            - or a dict `{"bus_base": "foo", "bus_width": 32}` that
+              expands to `["foo[0]", ..., "foo[31]"]` internally —
+              same shorthand as `debug.create_ila_core`'s per-probe spec.
+
+    Returned fields:
+      found       subset of *expanded* net names that resolved.
+      missing     subset of *expanded* net names that did not.
+      all_found   True iff `missing` is empty.
+
+    `success` is true even when `missing` is non-empty — the op
+    completed and returned its diagnostic. The caller decides whether
+    to abort or proceed based on `all_found`.
+
+    Failure modes:
+      client_error    a `bus_*` shorthand entry was malformed.
+      no_open_synth   the synthesized design is not open. Call
+                      `build.open_synth(c)` first.
+    """
+    if not query_one(client, "current_design -quiet"):
+        return fail(
+            "no_open_synth",
+            "No design is open. Call build.open_synth(c) before debug.verify_probe_nets().",
+        )
+
+    # Expand any bus-shorthand entries up front so the rest of the loop
+    # is a straight per-name check. We preserve the caller's order.
+    expanded: list[str] = []
+    for i, entry in enumerate(nets):
+        if isinstance(entry, str):
+            expanded.append(entry)
+            continue
+        if isinstance(entry, dict):
+            if "bus_base" not in entry or "bus_width" not in entry:
+                return fail(
+                    "client_error",
+                    f"nets[{i}]: dict entry must have both 'bus_base' "
+                    f"(str) and 'bus_width' (int). Got keys: "
+                    f"{sorted(entry.keys())}.",
+                )
+            base = str(entry["bus_base"])
+            try:
+                bwidth = int(entry["bus_width"])
+            except (TypeError, ValueError):
+                return fail(
+                    "client_error",
+                    f"nets[{i}]: 'bus_width' must be an int, got "
+                    f"{entry['bus_width']!r}.",
+                )
+            if bwidth < 1:
+                return fail(
+                    "client_error",
+                    f"nets[{i}]: 'bus_width' must be >= 1, got {bwidth}.",
+                )
+            expanded.extend(f"{base}[{j}]" for j in range(bwidth))
+            continue
+        return fail(
+            "client_error",
+            f"nets[{i}]: expected str or dict, got {type(entry).__name__}.",
+        )
+
+    found: list[str] = []
+    missing: list[str] = []
+    for name in expanded:
+        raw = query_one(client, f"llength [get_nets -quiet {tcl_str(name)}]")
+        try:
+            count = int(raw) if raw is not None and raw != "" else 0
+        except ValueError:
+            count = 0
+        if count > 0:
+            found.append(name)
+        else:
+            missing.append(name)
+
+    all_found = not missing
+    msg = (
+        f"{len(expanded)} net(s): {len(found)} found, {len(missing)} missing"
+    )
+    return ok(
+        msg,
+        client=client,
+        found=found,
+        missing=missing,
+        all_found=all_found,
+    )
 
 
 # ---------------------------------------------------------------------------

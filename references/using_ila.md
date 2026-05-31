@@ -701,6 +701,77 @@ the `[`) equals the target. The same goes for radix annotation rows
 (`Radix - UNSIGNED,UNSIGNED,...`) -- `ila.parse_csv` already skips
 them.
 
+### Sweeping a known input pattern via VIO-triggered HDL sequencer
+
+Distinct from the "Self-driving stimulus" entry above (which fires
+periodically forever): when you want **one finite sweep across a
+known input set, captured in one ILA shot**, the working pattern is
+
+1. Embed the input set in HDL — either an explicit ROM
+   (`reg [W-1:0] rom [0:N-1]; initial $readmemh("inputs.mem", rom);`)
+   or a counter that walks the input space (e.g. an 8-bit counter
+   that emits `0x00..0xFF` for a 256-point sweep).
+2. Add a `run_sweep` signal driven from VIO. While `run_sweep=1`, an
+   internal sequencer advances through the input set one entry per
+   clock with `data_valid=1`. When the sweep completes, raise a
+   `sweep_done` (latched) flag.
+3. Set the ILA trigger to `run_sweep` rising edge (or to a
+   `cordic_done`-style done pulse if your DUT has multi-cycle
+   latency). Set trigger_position near the front of the capture
+   buffer so the whole sweep lands in the window.
+4. From the host: pulse `rst`, set `run_sweep=1`, wait for
+   `wait_for_capture` to return FULL, export CSV, read VIO
+   `sweep_done_latched` for completion confirmation.
+
+This collapses what would otherwise be 256-plus separate VIO round
+trips (each ~1 second at human-paced VIO speeds) into a single arm /
+capture / export cycle that completes in tens of milliseconds of
+fabric time. It also gives you a deterministic, repeatable input
+ordering -- the ILA CSV row `k` always corresponds to input `k` in
+your ROM / counter sequence.
+
+A natural pairing: have Python emit the ROM `.mem` file *and* compute
+the gold-model expected outputs from the same input array, then
+compare against the captured CSV. See [using_simulation.md
+"Stimulus design patterns"](using_simulation.md#stimulus-design-patterns)
+for that side of the pattern.
+
+### ILA samples are pre-edge; registered outputs are 1 ILA row late
+
+ILA captures the value of each probe **on the rising edge of the ILA
+clock**, before the next rising edge updates anything. So a
+registered output (`reg X <= ...;`) that becomes valid on edge `k+1`
+appears at ILA row `k+1` -- the row whose `data_in` shows the
+*previous* input.
+
+Concretely, for a "data_in -> registered data_out" path (one cycle
+of latency):
+
+```
+row | data_in | data_out (= sbox[data_in_at_row k-1])
+  0 | 0x00    | (X)
+  1 | 0x01    | 0x63   (= sbox[0x00])
+  2 | 0x02    | 0x7c   (= sbox[0x01])
+  3 | 0x03    | 0x77   (= sbox[0x02])
+```
+
+When you compare ILA capture against a Python gold model, pair them
+with the **offset** that matches your design's latency:
+
+- Pure registered output: `gold[k]` matches `ila["data_out"][k+1]`.
+- FSM that fires `valid_out` and its result on the *same* edge
+  (sqrt-style, 16-cycle FSM that registers `root_out` at the same
+  edge as `valid_out`): `gold[k]` matches `ila["root_out"][k]` at the
+  rows where `valid_out=1`. No offset.
+- Multi-cycle pipeline of depth D: `gold[k]` matches the row where
+  the corresponding input was injected D rows earlier.
+
+The rule of thumb: figure out the latency in your sim trace first
+(the same `$display` rule applies — a `@(posedge clk); #1;` print
+shows the post-edge value, but if you read on the same edge as the
+input you're driving, you see the pre-edge), then apply the same
+offset to the ILA-side comparator.
+
 ## 11. References
 
 - [UG908 -- Programming and Debugging](https://docs.amd.com/r/en-US/ug908-vivado-programming-debugging/)

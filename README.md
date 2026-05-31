@@ -39,16 +39,16 @@ concrete examples to set expectations:
 
 ## Operations at a glance
 
-The SKILL exposes **45 high-level operations** through a single CLI
+The SKILL exposes **48 high-level operations** through a single CLI
 entry point: `scripts/vivado_op.py`. Send a JSON request on stdin,
 get a JSON response on stdout. The categories:
 
 | Category    | What it covers |
 |---|---|
-| `project.*`  | Project metadata snapshot |
-| `build.*`    | Launching and observing synth/impl runs, bitstream lookup, timing-summary parsing |
+| `project.*`  | Project metadata snapshot; `add_sources` for the standard "add files + set top + update compile order" boilerplate |
+| `build.*`    | Launching and observing synth/impl runs, bitstream lookup, timing-summary parsing, utilization summary |
 | `hardware.*` | Hardware Manager, JTAG target control, device programming |
-| `debug.*`    | VIO probe enumeration and read/write, with atomic batch writes; build-time VIO/ILA core helpers |
+| `debug.*`    | VIO probe enumeration and read/write, with atomic batch writes; build-time VIO/ILA core helpers; `find_clock_net` / `verify_probe_nets` for ILA prep |
 | `ila.*`      | ILA configure / set_triggers / arm / wait / export CSV / parse |
 | `sim.*`      | xsim driver with bounded run loop, simulate.log summary |
 | `bridge.*`   | Locating `vivado.log` / `vivado.jou` |

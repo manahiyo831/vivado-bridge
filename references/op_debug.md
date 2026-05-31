@@ -312,8 +312,10 @@ exists in 2024.1).
 
 Per-probe options:
   - `width` (int, required, 1..256)
-  - `init`  (int, output probes only, default 0). Must fit in `width`
-            bits; raised as `client_error` otherwise.
+  - `init`  (int, output probes only, default 0). Decimal int in JSON;
+            the helper rejects hex strings with an explanatory
+            `client_error` if you pass `"0xAA"`. Must fit in `width`
+            bits.
 
 Top-level options:
   - `enable_activity_detection` (bool, default false): when true,
@@ -351,12 +353,14 @@ sequence:
 # Open the synthesized netlist
 echo '{"op":"build.open_synth","params":{}}' | python vivado_op.py
 
-# Insert the ILA core
+# Insert the ILA core. Use `bus_base + bus_width` shorthand for buses;
+# fall back to an explicit `nets` list when bit positions are not
+# contiguous or you want to skip bits.
 echo '{"op":"debug.create_ila_core","params":{
   "name":"u_ila_0",
   "clock_net":"clk_IBUF",
   "probes":[
-    {"name":"count","nets":["count[0]","count[1]","count[2]","count[3]","count[4]","count[5]","count[6]","count[7]","count[8]","count[9]","count[10]","count[11]","count[12]","count[13]","count[14]","count[15]"]},
+    {"name":"count","bus_base":"count","bus_width":16},
     {"name":"en","nets":"en"},
     {"name":"direction","nets":"direction"}
   ],
@@ -395,13 +399,21 @@ Wraps the `create_debug_core` + per-probe `connect_debug_port` +
 underlying flow is ~25 lines of Tcl with several footguns; see
 [using_ila.md](using_ila.md) section 10b for the mechanics this hides.
 
-Per-probe spec:
+Per-probe spec — pass EITHER an explicit `nets` list OR the bus
+shorthand, not both:
   - `name` (str, required) -- runtime label / CSV column header
-  - `nets` (str | list[str], required) -- one net or a list of bit
-    nets (e.g. `["count[0]", "count[1]", ...]`). String values
-    are split on whitespace. Probe width is implied by `len(nets)`.
+  - `nets` (str | list[str]) -- one net or a list of bit nets
+    (e.g. `["count[0]", "count[1]", ...]`). String values are split
+    on whitespace. Probe width is implied by `len(nets)`.
+  - `bus_base` (str) + `bus_width` (int) -- shorthand for a
+    contiguous `[0..bus_width-1]` bus. Expands to
+    `[<bus_base>[0], <bus_base>[1], ..., <bus_base>[bus_width-1]]`
+    before the rest of the helper runs. Use this whenever bit
+    positions are contiguous; fall back to `nets` for irregular
+    bit selections.
   - `width` (int, optional) -- redundant sanity check against
-    `len(nets)`; mismatch is a `client_error`.
+    `len(nets)`; mismatch is a `client_error`. Ignored when the
+    bus shorthand is used (width = `bus_width` by construction).
 
 Other arguments:
   - `xdc_path` (str | null) -- where the debug XDC ends up. null
@@ -480,6 +492,117 @@ Failure modes:
   - `not_open` -- no design currently open.
   - `tcl_error` -- propagated from `delete_debug_core` /
     `remove_files` / `save_constraints`.
+
+### debug.find_clock_net
+
+Resolve the post-synth net driving a clock pin on an internal cell.
+The value `create_ila_core` / `create_debug_core` need as their
+`clock_net` argument is a post-synth net name (typically
+`clk_125_IBUF_BUFG`), not the port name `clk` from your HDL.
+
+In a flat post-synth netlist the top-level `clk` port is no longer
+addressable as `<top>/clk` — the top module is unwrapped during
+synthesis and only the leaf cells (plus the IBUF/BUFG chain) survive.
+The reliable recipe is to point at the `clk` pin of a known DUT
+instance under the top:
+
+```tcl
+get_nets -of_objects [get_pins <instance>/<clock_port>]
+```
+
+For example, `u_cordic/clk`, `u_core/clk`, or `u_crc/clk` —
+whatever you named the DUT instance in your HDL top. This op wraps
+that recipe so it does not have to be re-typed (and re-quoted
+through PowerShell, which expands `$` inside double-quoted
+`exec_tcl.py "..."` arguments).
+
+Requires the synthesized design to be open: call
+`build.open_synth(c)` first. The op does not auto-open it so session
+state changes stay explicit.
+
+Request:
+
+```json
+{"op": "debug.find_clock_net",
+ "params": {"instance": "u_foo", "clock_port": "clk"}}
+```
+
+`clock_port` defaults to `"clk"` (the overwhelming convention);
+override for designs that use `sys_clk` / `ACLK` / etc.
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "clock net = clk_125_IBUF_BUFG",
+  "net": "clk_125_IBUF_BUFG",
+  "candidates": ["clk_125_IBUF_BUFG"],
+  "warnings": []
+}
+```
+
+When more than one net resolves (unusual netlist, e.g. heavy clock
+buffer fan-out), `net` is set to the first candidate and a `warnings`
+entry lists the full set so the caller can pick explicitly.
+
+#### Failure modes
+
+| `error_kind` | When |
+|---|---|
+| `no_open_synth` | The synthesized design is not open. Call `build.open_synth(c)` first. |
+| `not_found`     | The pin or net could not be resolved. Most common cause: passing the HDL top module name (e.g. "foo_top") instead of an instance name (e.g. "u_foo"). The top is flattened post-synth and is not addressable as `<top>/clk`. |
+
+### debug.verify_probe_nets
+
+Check which net names exist in the current netlist before passing
+them to `create_ila_core`. `create_ila_core` accepts a list of nets
+silently; if a net was optimised away or mis-typed, it will be wired
+to nothing and the discovery happens later (at implementation, or
+worse, at runtime when probes return nonsense). Calling this op
+first surfaces the problem at design time.
+
+Request — each entry in `nets` is either a string net name or the
+same `{bus_base, bus_width}` shorthand `create_ila_core` accepts.
+Mix freely:
+
+```json
+{"op": "debug.verify_probe_nets",
+ "params": {"nets": [
+   "foo/bar",
+   "foo/baz[7:0]",
+   {"bus_base": "samples_out_w", "bus_width": 32},
+   "missing_net"
+ ]}}
+```
+
+Response — the dict entry is expanded to per-bit names before the
+check, so `found` / `missing` always contain expanded names:
+
+```json
+{
+  "success": true,
+  "message": "35 net(s): 34 found, 1 missing",
+  "found":   ["foo/bar", "foo/baz[7:0]",
+              "samples_out_w[0]", "...", "samples_out_w[31]"],
+  "missing": ["missing_net"],
+  "all_found": false,
+  "warnings": []
+}
+```
+
+`success` is `true` even when `missing` is non-empty — the op
+completed and returned its diagnostic. The caller decides whether to
+abort or proceed based on `all_found`. Bit-slice notation
+(`bus[7:0]`) inside string entries is accepted; it is forwarded to
+Vivado's `get_nets` verbatim.
+
+#### Failure modes
+
+| `error_kind` | When |
+|---|---|
+| `client_error`  | A `bus_*` shorthand entry was malformed (missing key, non-int width, or width &lt; 1). The dispatcher does not reject the call; the helper does, with a precise message. |
+| `no_open_synth` | The synthesized design is not open. Call `build.open_synth(c)` first. |
 
 ## ILA operations
 

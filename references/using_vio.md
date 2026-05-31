@@ -174,6 +174,55 @@ on `MARK_DEBUG`, the ILA will grab those nets too. See
 [using_ila.md §8](using_ila.md) for the consequences and the recommended
 workaround (explicit `connect_debug_port` to a named net list).
 
+### Sharing a wire with ILA: `mark_debug_valid + keep` is necessary but not always sufficient
+
+The standard recipe for sharing a multi-bit wire between a VIO input
+probe and an ILA capture probe is the three-attribute set
+`(* mark_debug = "true", mark_debug_valid = "true", keep = "true" *)`,
+documented in [using_ila.md §8.5](using_ila.md). That defuses the
+`[Chipscope 16-213]` impl-time failure and stops the VIO/ILA name
+collision from renaming the ILA-side probe to `_1`.
+
+It does **not** defuse a different problem that turns up after
+synthesis: the optimiser may decide that some bits of the shared
+wire are observable through the ILA copy and **drop them from the
+VIO copy**, leaving the VIO probe at a fraction of its declared
+width. The symptom is a VIO probe that shows up in `list_vio_probes`
+with `width=1` (or some other smaller value) even though the HDL
+declared it 16-bit, despite the three attributes being correctly
+applied. Root cause is post-synth optimisation, not an attribute typo.
+
+**Recommended pattern when you need both VIO read-back and ILA
+capture of the same value:** do not share the wire. Use a dedicated
+VIO-side register that nothing else touches, and a separate
+ILA-bound wire with the three attributes:
+
+```verilog
+reg [15:0] counter;                                  // your real counter
+
+// VIO read-back path: dedicated register, no mark_debug.
+reg [15:0] counter_for_vio;
+always @(posedge clk) counter_for_vio <= counter;
+// ... wire counter_for_vio to a VIO probe_in.
+
+// ILA capture path: a dedicated wire with the three attributes.
+(* mark_debug = "true", mark_debug_valid = "true", keep = "true" *)
+wire [15:0] counter_for_ila = counter;
+// ... include counter_for_ila in the ILA probe list.
+```
+
+The cost is one extra 16-bit register and one wire (negligible).
+The benefit is that the optimiser cannot collapse the two paths
+into each other, so the VIO probe stays at its declared width
+regardless of what `mark_debug` optimisation chooses to do.
+
+Sharing the wire directly with the three attributes is still the
+right starting point — it works in most designs and avoids the extra
+register. Reach for the dedicated-register pattern only when
+`list_vio_probes` reports a narrower-than-expected width on a wire
+that is also on the ILA, since at that point you have already paid
+the cost of debugging it.
+
 ## 3. Reading and writing probe values
 
 ### Default radix is HEX
@@ -254,6 +303,60 @@ HDL instead (e.g. a rising-edge detector on a VIO bit that latches
 for one clock). Driving cycle-precise timing from VIO is fighting
 the tool — VIO is for human-rate state changes; ILA + a clock-domain
 internal pulse generator is for cycle-precise stimulus.
+
+### The symmetric read-side problem: VIO can't observe 1-cycle pulses
+
+The same human-pace constraint applies to **reading** VIO probes,
+not just driving them. A 1-cycle pulse in fabric (e.g. a `done`
+strobe that asserts for one clock alongside `valid_out`) is
+effectively invisible to a host-side polling loop: by the time the
+poll has crossed the JTAG / dbg_hub pipeline, the fabric pulse is
+long gone.
+
+The workaround is a sticky latch in HDL, with reset tied to the
+same VIO `rst` line you already drive:
+
+```verilog
+reg done_latched;
+always @(posedge clk) begin
+    if (rst)               done_latched <= 1'b0;
+    else if (valid_done)   done_latched <= 1'b1;
+end
+// expose done_latched as a VIO probe_in
+```
+
+Now a VIO read picks up `done_latched=1` from the next poll
+onward, until the next `rst` clears it. Pair it with the
+free-running `samples_processed` counter or a captured `result_at_done`
+snapshot register and you have everything a polling host needs.
+
+### Latching a "final result" snapshot — delay the latch by one cycle
+
+A subtler variant of the above: when you want VIO to read **the
+value of a registered output at the moment `done` fired**, latching
+on `done` rising directly captures the *previous* result, not the
+final one. The reason is the same one-cycle skew that bites ILA
+post-edge / registered-output alignment (see [using_ila.md "ILA
+samples are pre-edge"](using_ila.md#ila-samples-are-pre-edge-registered-outputs-are-1-ila-row-late)):
+the registered output updates on the same edge that asserts
+`done`, but the latch sampling `done` sees the pre-edge value of
+the output, which is the result from the previous run.
+
+The fix is to delay the latch by one cycle (`done_d1`):
+
+```verilog
+reg done_d1;
+reg [15:0] result_at_done;
+always @(posedge clk) begin
+    done_d1 <= valid_done;            // 1-cycle delayed
+    if (done_d1) result_at_done <= data_out;  // now sampling post-edge
+end
+```
+
+VIO reads `result_at_done` at any time and sees the correct final
+value of `data_out` for the most recent completed run. This
+generalises: for any "snapshot the registered output at completion"
+case, sample the latch enable one cycle after the completion strobe.
 
 ## 4. Verification by loopback
 

@@ -24,6 +24,8 @@ Exit codes: 0 on helper-reported success, 1 otherwise.
 
 from __future__ import annotations
 
+import difflib
+import inspect
 import json
 import sys
 import traceback
@@ -81,10 +83,12 @@ DISPATCH: dict[str, tuple[object, bool]] = {
     "debug.create_ila_core":    (debug.create_ila_core, True),
     "debug.create_vio":         (debug.create_vio, True),
     "debug.delete_ila_core":    (debug.delete_ila_core, True),
+    "debug.find_clock_net":     (debug.find_clock_net, True),
     "debug.list_vio_probes":    (debug.list_vio_probes, True),
     "debug.list_vios":          (debug.list_vios, True),
     "debug.read_vio_probe":     (debug.read_vio_probe, True),
     "debug.read_vio_probes_all": (debug.read_vio_probes_all, True),
+    "debug.verify_probe_nets":  (debug.verify_probe_nets, True),
     "debug.write_vio_probe":    (debug.write_vio_probe, True),
     "debug.write_vio_probes":   (debug.write_vio_probes, True),
     # hardware
@@ -109,6 +113,7 @@ DISPATCH: dict[str, tuple[object, bool]] = {
     "ila.find_column":          (ila.find_column, False),
     "ila.parse_csv":            (ila.parse_csv, False),
     # project
+    "project.add_sources":      (project.add_sources, True),
     "project.info":             (project.info, True),
     # sim
     "sim.close_sim":            (sim.close_sim, True),
@@ -135,6 +140,11 @@ Protocol:
         error_kind values:
             protocol_error   bad JSON / missing op / wrong shape
             unknown_op       op not in dispatch table
+            client_error     bad params (unknown / missing kwarg);
+                             response includes `unknown_kwargs`,
+                             `missing_required`, `suggestions` (a
+                             {wrong_name: closest_accepted_name | null}
+                             dict), and `accepted_kwargs`
             connect_failed   Client.connect() raised
             helper_exception helper raised an unhandled exception
                              (also includes exception_type, traceback)
@@ -177,6 +187,79 @@ def _dispatcher_error(
     }
     out.update(extra)
     return out
+
+
+# ---------------------------------------------------------------------------
+# kwargs pre-flight (catch wrong kwarg names with suggestions)
+# ---------------------------------------------------------------------------
+
+def _validate_kwargs(
+    func, params: dict, *, needs_client: bool,
+) -> tuple[list[str], list[str]]:
+    """Return (unknown_kwargs, missing_required_kwargs) for a helper.
+
+    Examines `func`'s signature and compares it against the param keys
+    the caller passed. The intent is to catch kwarg-name mistakes
+    BEFORE they bubble up as a generic Python TypeError, and to attach
+    a "did you mean ...?" suggestion to each one. This gives the AI
+    caller an actionable error in one round trip instead of the
+    helper_exception loop they otherwise fall into.
+
+    `needs_client=True` means the first positional parameter is the
+    `client` argument that the dispatcher itself supplies; the
+    validation drops it before comparing kwargs.
+
+    Helpers using **kwargs (var-keyword) are exempt from unknown-kwarg
+    detection -- they accept anything, so we cannot judge. Required-arg
+    detection still applies to such helpers.
+    """
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        # Builtin / C-implemented callable. Skip; let the TypeError
+        # path handle any later mismatch.
+        return [], []
+
+    parameters = list(sig.parameters.values())
+    if needs_client and parameters:
+        parameters = parameters[1:]  # drop `client`
+
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+    accepted: set[str] = set()
+    required: set[str] = set()
+    for p in parameters:
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            accepted.add(p.name)
+            if p.default is inspect.Parameter.empty:
+                required.add(p.name)
+
+    passed = set(params.keys())
+    unknown: list[str] = []
+    if not accepts_var_kw:
+        unknown = sorted(passed - accepted)
+
+    missing = sorted(required - passed)
+    return unknown, missing
+
+
+def _suggest_kwargs(unknown: list[str], accepted: list[str]) -> dict[str, str | None]:
+    """For each unknown kwarg, return the closest accepted kwarg name (or None).
+
+    `difflib.get_close_matches` ranks by SequenceMatcher ratio; cutoff
+    0.5 picks up obvious typos and the recurring kwarg-shape mistakes
+    (`triggers` -> `values`, `writes` -> `values`, `timeout_s` ->
+    `timeout`) while staying conservative enough not to invent
+    suggestions for completely unrelated names.
+    """
+    suggestions: dict[str, str | None] = {}
+    for name in unknown:
+        match = difflib.get_close_matches(name, accepted, n=1, cutoff=0.5)
+        suggestions[name] = match[0] if match else None
+    return suggestions
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +402,63 @@ def _run_from_stdin() -> int:
     else:
         call_args = ()
 
+    # Pre-flight kwarg validation. Bad kwarg names are by far the
+    # most common caller mistake (the AI guesses a plausible-sounding
+    # kwarg, the helper raises a generic TypeError, the AI has to
+    # parse the exception to recover). Catching that here lets us
+    # emit a structured client_error with a "did you mean ...?" hint
+    # in one round trip.
+    try:
+        unknown_kwargs, missing_required = _validate_kwargs(
+            func, params, needs_client=needs_client,
+        )
+    except Exception:  # noqa: BLE001 -- never fail dispatch on a sig probe
+        unknown_kwargs, missing_required = [], []
+
+    if unknown_kwargs or missing_required:
+        try:
+            sig = inspect.signature(func)
+            accepted_names = [
+                p.name for p in list(sig.parameters.values())[
+                    1 if needs_client else 0:
+                ]
+                if p.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            ]
+        except (TypeError, ValueError):
+            accepted_names = []
+
+        parts: list[str] = []
+        suggestions: dict[str, str | None] = {}
+        if unknown_kwargs:
+            suggestions = _suggest_kwargs(unknown_kwargs, accepted_names)
+            for name, match in suggestions.items():
+                if match:
+                    parts.append(f"unknown kwarg {name!r}; did you mean {match!r}?")
+                else:
+                    parts.append(f"unknown kwarg {name!r}")
+        if missing_required:
+            parts.append(
+                f"missing required kwarg(s): {missing_required}"
+            )
+
+        message = (
+            f"{op}: " + "; ".join(parts) +
+            f". Accepted kwargs: {accepted_names}."
+        )
+        _emit(_dispatcher_error(
+            "client_error",
+            message,
+            op=op,
+            unknown_kwargs=unknown_kwargs,
+            missing_required=missing_required,
+            suggestions=suggestions,
+            accepted_kwargs=accepted_names,
+        ))
+        return 1
+
     # Invoke the helper. Only catch unhandled exceptions here -- helpers
     # report their own failures via {"success": False, ...} dicts and
     # we must NOT mask those.
@@ -327,7 +467,10 @@ def _run_from_stdin() -> int:
     except TypeError as exc:
         # Most common cause: bad params keys (unexpected kwarg / missing
         # required arg). Surface as helper_exception so the agent can
-        # see exactly what the helper rejected.
+        # see exactly what the helper rejected. The pre-flight above
+        # catches most kwarg shape problems first, so reaching here
+        # usually indicates a value-level type mismatch (e.g. passing
+        # a dict where a list was expected).
         _emit(_dispatcher_error(
             "helper_exception",
             f"helper {op} raised TypeError: {exc}",

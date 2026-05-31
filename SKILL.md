@@ -374,7 +374,7 @@ n=1 observations.
 
 The skill exposes **one canonical entry point**: `scripts/vivado_op.py`.
 Drive every supported operation through it -- a JSON request on stdin,
-a JSON response on stdout. The 45 ops cover project metadata, synth /
+a JSON response on stdout. The 48 ops cover project metadata, synth /
 impl, Hardware Manager, VIO and ILA, simulation, and log inspection.
 
 ```bash
@@ -448,11 +448,14 @@ links to its anchor in the corresponding `references/op_*.md`.
 
 ### `project.*` ops -- [op_project.md](references/op_project.md)
 
-Read-only project metadata snapshot.
+Project metadata snapshot, plus `add_sources` for the "add files +
+set top + update compile order" boilerplate that begins almost every
+project-driven workflow.
 
 | Function | What it does |
 |---|---|
 | [`info`](references/op_project.md#projectinfo) | **Snapshot.** name / part / board_part / top / sources / runs in one round trip. |
+| [`add_sources`](references/op_project.md#projectadd_sources) | Bundle `add_files` (hdl / constrs / sim) + `set_property top` + `update_compile_order` into one call. |
 
 ### `build.*` ops -- [op_build.md](references/op_build.md)
 
@@ -503,6 +506,8 @@ VIO IP customisation, VIO probe read/write, ILA core create/delete.
 | [`create_vio`](references/op_debug.md#debugcreate_vio) | Build-time helper: customise a VIO IP from a probe spec (replaces ~25 lines of raw Tcl). |
 | [`create_ila_core`](references/op_debug.md#debugcreate_ila_core) | Build-time helper: insert `xil_defaultlib_ila` debug core into a synthesized design. |
 | [`delete_ila_core`](references/op_debug.md#debugdelete_ila_core) | Build-time helper: remove a previously created ILA core. |
+| [`find_clock_net`](references/op_debug.md#debugfind_clock_net) | Build-time helper: resolve `clk_125_IBUF_BUFG`-style post-synth net name from a DUT instance pin (the `clock_net` argument `create_ila_core` wants). |
+| [`verify_probe_nets`](references/op_debug.md#debugverify_probe_nets) | Build-time helper: pre-flight check that a list of net names exist in the netlist before passing them to `create_ila_core`. |
 
 ### `ila.*` ops -- [op_ila.md](references/op_ila.md)
 
